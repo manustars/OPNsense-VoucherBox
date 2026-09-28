@@ -12,4 +12,6 @@ services:
     environment:
       - NODE_ENV=production
       - BASEPATH=/wifi/
+    volumes:
+      - ./data:/app/data
     restart: always
