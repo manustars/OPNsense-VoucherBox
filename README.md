@@ -276,9 +276,9 @@ BASEPATH=/wifi/
 
 | Variable                       | Description                                   |
 | ------------------------------ | --------------------------------------------- |
-| `EMAIL_ADMIN`                  | Default/administrative email address          |
+| `EMAIL_ADMIN`                  | BCC address for voucher emails (optional)     |
 | `EMAIL_SUBJECT`                | Subject used for voucher emails               |
-| `SMTP_HOST`                    | SMTP server hostname                          |
+| `SMTP_HOST`                    | SMTP server hostname (empty = email disabled) |
 | `SMTP_PORT`                    | SMTP server port                              |
 | `SMTP_USER`                    | SMTP username                                 |
 | `SMTP_FROM`                    | Sender address                                |
@@ -327,7 +327,9 @@ VoucherBox is an interface around that functionality.
 
 # 📧 Email Delivery
 
-VoucherBox can send generated vouchers through SMTP.
+VoucherBox can optionally send generated vouchers through SMTP.
+
+Email delivery is **optional**: it is enabled only when `SMTP_HOST` is set. Without it, the email field is hidden and the voucher (username, password, QR code) is shown on the page only. If sending fails, the voucher is still returned and shown, with a warning.
 
 Configure:
 

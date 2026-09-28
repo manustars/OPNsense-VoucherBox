@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { FaWifi } from 'react-icons/fa';
 
 
@@ -15,10 +15,20 @@ export default function VoucherForm() {
   const [errors, setErrors] = useState<{ email?: string; validity?: string; endDate?: string }>({});
   const [fetchError, setFetchError] = useState(false);
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
+  const [voucher, setVoucher] = useState<{ username: string; password: string } | null>(null);
+  const [emailEnabled, setEmailEnabled] = useState(false);
+  const [emailWarning, setEmailWarning] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('api/config')
+      .then(res => (res.ok ? res.json() : null))
+      .then(cfg => setEmailEnabled(Boolean(cfg?.emailEnabled)))
+      .catch(() => setEmailEnabled(false));
+  }, []);
 
   function validate() {
     const newErrors: typeof errors = {};
-    if (!email.match(/^\S+@\S+\.\S+$/)) {
+    if (email && !email.match(/^\S+@\S+\.\S+$/)) {
       newErrors.email = 'Please enter a valid email address.';
     }
     if (!validity || validity < 1) {
@@ -37,6 +47,8 @@ export default function VoucherForm() {
     setFetchSuccess(false);
     setFetchError(false);
     setQrCodeDataUrl(null);
+    setVoucher(null);
+    setEmailWarning(null);
     const validationErrors = validate();
     setErrors(validationErrors);
     if (Object.keys(validationErrors).length > 0) return;
@@ -53,7 +65,7 @@ export default function VoucherForm() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          email,
+          email: emailEnabled && email ? email : undefined,
           validity: validitySeconds,
           expirytime: expiryTimestamp,
         }),
@@ -66,6 +78,12 @@ export default function VoucherForm() {
         setEndDate(defaultEndDate.toISOString().slice(0, 16));
         if (data.qrCodeDataUrl) {
           setQrCodeDataUrl(data.qrCodeDataUrl);
+        }
+        if (data.voucher) {
+          setVoucher({ username: data.voucher.username, password: data.voucher.password });
+        }
+        if (emailEnabled && email && !data.emailSent) {
+          setEmailWarning('The voucher was created, but the email could not be sent.');
         }
       } else {
         setFetchError(true);
@@ -84,18 +102,17 @@ export default function VoucherForm() {
         <h2 className="text-2xl font-bold mb-6 text-center text-gray-800">Create Wifi Voucher</h2>
       </div>
       <form onSubmit={handleSubmit} className="space-y-6">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
+        {emailEnabled && (<div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Email (optional)</label>
           <input
             type="email"
             className={`w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 ${errors.email ? 'border-red-500' : 'border-gray-300'}`}
             value={email}
             onChange={e => setEmail(e.target.value)}
-            required
             placeholder="user@example.com"
           />
           {errors.email && <p className="text-red-500 text-xs mt-1">{errors.email}</p>}
-        </div>
+        </div>)}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Validity (hours)</label>
           <input
@@ -124,7 +141,7 @@ export default function VoucherForm() {
           disabled={loading}
           className="w-full py-2 text-lg font-semibold rounded-lg bg-blue-500 text-white hover:bg-blue-600 transition disabled:opacity-50"
         >
-          {loading ? 'Sending...' : 'Send'}
+          {loading ? 'Creating...' : 'Create voucher'}
         </button>
       </form>
       {fetchSuccess && (
@@ -132,6 +149,17 @@ export default function VoucherForm() {
           <div className="mt-6 text-green-600 font-bold text-center text-xl">
             New Voucher created
           </div>
+          {voucher && (
+            <div className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-lg">
+              <span className="text-gray-500">Username</span>
+              <span className="font-mono font-bold select-all">{voucher.username}</span>
+              <span className="text-gray-500">Password</span>
+              <span className="font-mono font-bold select-all">{voucher.password}</span>
+            </div>
+          )}
+          {emailWarning && (
+            <div className="mt-2 text-amber-600 text-center text-sm">{emailWarning}</div>
+          )}
           {qrCodeDataUrl && (
             <div className="mt-4 flex flex-col items-center">
               <img src={qrCodeDataUrl} alt="Voucher Login QR Code" className="w-40 h-40" />

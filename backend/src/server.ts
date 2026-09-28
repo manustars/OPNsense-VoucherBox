@@ -7,7 +7,7 @@ import dotenv from 'dotenv';
 import pino from 'pino';
 import { OpnsenseApi } from './OpnsenseApi';
 import { Voucher } from './Models';
-import { asyncHandler, requireBody } from './expressUtils';
+import { asyncHandler } from './expressUtils';
 import path from 'path';
 import QRCode from 'qrcode';
 
@@ -42,13 +42,15 @@ export const logger = pino({
 const app = express();
 app.use(express.json());
 
-const EMAIL_ADMIN = typeof process.env.EMAIL_ADMIN === 'string' ? process.env.EMAIL_ADMIN : (() => { throw new Error('EMAIL_ADMIN not set'); })();
+// Email delivery is optional: it is enabled only when SMTP_HOST is set
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const EMAIL_ENABLED = SMTP_HOST !== '';
+const EMAIL_ADMIN = process.env.EMAIL_ADMIN || undefined;
 const EMAIL_SUBJECT = typeof process.env.EMAIL_SUBJECT === 'string' ? process.env.EMAIL_SUBJECT : 'Your Voucher Details';
-const SMTP_HOST = typeof process.env.SMTP_HOST === 'string' ? process.env.SMTP_HOST : (() => { throw new Error('SMTP_HOST not set'); })();
-const SMTP_PORT = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : (() => { throw new Error('SMTP_PORT not set'); })();
-const SMTP_USER = typeof process.env.SMTP_USER === 'string' ? process.env.SMTP_USER : (() => { throw new Error('SMTP_USER not set'); })();
-const SMTP_PASS = typeof process.env.SMTP_PASS === 'string' ? process.env.SMTP_PASS : (() => { throw new Error('SMTP_PASS not set'); })();
-const SMTP_FROM = typeof process.env.SMTP_FROM === 'string' ? process.env.SMTP_FROM : SMTP_USER;
+const SMTP_PORT = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : (EMAIL_ENABLED ? (() => { throw new Error('SMTP_PORT not set'); })() : 0);
+const SMTP_USER = typeof process.env.SMTP_USER === 'string' ? process.env.SMTP_USER : (EMAIL_ENABLED ? (() => { throw new Error('SMTP_USER not set'); })() : '');
+const SMTP_PASS = typeof process.env.SMTP_PASS === 'string' ? process.env.SMTP_PASS : (EMAIL_ENABLED ? (() => { throw new Error('SMTP_PASS not set'); })() : '');
+const SMTP_FROM = typeof process.env.SMTP_FROM === 'string' && process.env.SMTP_FROM !== '' ? process.env.SMTP_FROM : SMTP_USER;
 const SMTP_TLS = process.env.SMTP_TLS === 'true';
 const EMAIL_TEMPLATE_PATH = typeof process.env.EMAIL_TEMPLATE_PATH === 'string' ? process.env.EMAIL_TEMPLATE_PATH : "emailtemplate.mjml";
 // OPNSENSE_HOST is preferred; HOSTNAME is kept for backward compatibility (in Kubernetes HOSTNAME is the pod name)
@@ -114,11 +116,42 @@ async function cleanupVoucherGroups(api: OpnsenseApi, provider: string): Promise
     }
 }
 
+// Helper to send the voucher by email
+async function sendVoucherEmail(email: string, vouchertmp: unknown): Promise<void> {
+    // Compile MJML template and generate HTML
+    const { html, error } = await compileVoucherEmail(vouchertmp);
+    if (error) {
+        throw new Error(error);
+    }
+    logger.debug({ html }, 'Prepared email HTML');
+
+    const transporter = nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_TLS,
+        auth: { user: SMTP_USER, pass: SMTP_PASS }
+    });
+
+    await transporter.sendMail({
+        from: SMTP_FROM,
+        to: email,
+        bcc: EMAIL_ADMIN,
+        subject: EMAIL_SUBJECT,
+        html
+    });
+    logger.debug({ to: email }, 'Sent voucher email');
+}
+
+logger.info(`Email delivery ${EMAIL_ENABLED ? 'enabled' : 'disabled (SMTP_HOST not set)'}`);
+
+app.get(`${BASEPATH}/api/config`, (_, res) => {
+    res.json({ emailEnabled: EMAIL_ENABLED });
+});
+
 app.post(`${BASEPATH}/api/createvoucher`,
-    requireBody('email'),
     asyncHandler(async (req, res) => {
         const { email, validity = 14400, expirytime = Date.now() + 86400000 }
-            = req.body as { email: string; validity?: number; expirytime?: number };
+            = (req.body ?? {}) as { email?: string; validity?: number; expirytime?: number };
 
 
         const vouchergroup = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
@@ -174,38 +207,24 @@ app.post(`${BASEPATH}/api/createvoucher`,
                 qrCodeDataUrl
             };
 
-            // Compile MJML template and generate HTML
-            const { html, error } = await compileVoucherEmail(vouchertmp);
-            if (error) {
-                logger.error({ error }, 'MJML compilation or template error');
-                return res.status(500).json({ error: error });
+            // The voucher already exists in OPNsense: an email failure must not hide it
+            let emailSent = false;
+            let emailError: string | undefined;
+            if (EMAIL_ENABLED && email) {
+                try {
+                    await sendVoucherEmail(email, vouchertmp);
+                    emailSent = true;
+                } catch (err) {
+                    emailError = (err as Error).message;
+                    logger.error({ err }, 'Failed to send voucher email');
+                }
             }
-            logger.debug({ voucher, html }, 'Prepared email HTML');
-
-            // Send email with voucher details
-            const transporter = nodemailer.createTransport({
-                host: SMTP_HOST,
-                port: SMTP_PORT,
-                secure: SMTP_TLS,
-                auth: { user: SMTP_USER, pass: SMTP_PASS }
-            });
-
-            const mailOptions: nodemailer.SendMailOptions = {
-                from: SMTP_FROM,
-                to: [email].filter(Boolean).join(","),
-                bcc: EMAIL_ADMIN,
-                subject: EMAIL_SUBJECT,
-                html
-            };
-            await transporter.sendMail(mailOptions);
-
-            logger.debug({ to: mailOptions.to }, 'Sent voucher email');
 
             // Clean up old voucher groups
             await cleanupVoucherGroups(api, provider);
 
-            res.json({ success: true, voucher, qrCodeDataUrl });
-            logger.info({ voucher, to: mailOptions.to }, 'Voucher created and email sent');
+            res.json({ success: true, voucher, qrCodeDataUrl, loginLink, emailSent, emailError });
+            logger.info({ username: voucher.username, vouchergroup, emailSent }, 'Voucher created');
         } catch (err: unknown) {
             logger.error({ err }, 'Error in /api/createvoucher');
             res.status(500).json({ error: (err as Error).message });
