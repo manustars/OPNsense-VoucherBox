@@ -185,7 +185,8 @@ Configure the credentials using the VoucherBox environment variables:
 ```dotenv
 API_USERNAME=...
 API_PASSWORD=...
-HOSTNAME=...
+OPNSENSE_HOST=...
+OPNSENSE_PORT=...
 ```
 
 The names are retained for compatibility with the application's configuration, but conceptually:
@@ -193,7 +194,8 @@ The names are retained for compatibility with the application's configuration, b
 ```text
 API_USERNAME = OPNsense API key
 API_PASSWORD = OPNsense API secret
-HOSTNAME     = OPNsense hostname
+OPNSENSE_HOST = OPNsense hostname or IP
+OPNSENSE_PORT = OPNsense WebGUI/API port (optional, default 443)
 ```
 
 ---
@@ -258,7 +260,8 @@ SMTP_FROM="WiFi Voucher <voucher@example.com>"
 SMTP_PASS=your-smtp-password
 SMTP_TLS=false
 
-HOSTNAME=firewall.example.com
+OPNSENSE_HOST=firewall.example.com
+OPNSENSE_PORT=443
 
 API_USERNAME=your-opnsense-api-key
 API_PASSWORD=your-opnsense-api-secret
@@ -281,9 +284,11 @@ BASEPATH=/wifi/
 | `SMTP_FROM`                    | Sender address                                |
 | `SMTP_PASS`                    | SMTP password                                 |
 | `SMTP_TLS`                     | SMTP TLS configuration                        |
-| `HOSTNAME`                     | OPNsense hostname                             |
+| `OPNSENSE_HOST`                | OPNsense hostname or IP (legacy: `HOSTNAME`)  |
+| `OPNSENSE_PORT`                | OPNsense WebGUI/API port (optional, default 443) |
 | `API_USERNAME`                 | OPNsense API key                              |
 | `API_PASSWORD`                 | OPNsense API secret                           |
+| `PROVIDER`                     | Captive Portal voucher server name (default `Voucher Server`) |
 | `ALLOW_SELFSIGNED_HTTPS_CERTS` | Allow self-signed OPNsense HTTPS certificates |
 | `CAPTIVE_PORTAL_URL`           | Captive Portal URL presented to guests        |
 | `BASEPATH`                     | VoucherBox URL prefix                         |
@@ -411,7 +416,7 @@ Verify that your `.env` file exists and contains the required values.
 
 Check:
 
-1. `HOSTNAME`
+1. `OPNSENSE_HOST` / `OPNSENSE_PORT`
 2. API key
 3. API secret
 4. OPNsense connectivity
