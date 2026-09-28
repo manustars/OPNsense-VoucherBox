@@ -8,6 +8,9 @@ import pino from 'pino';
 import { OpnsenseApi } from './OpnsenseApi';
 import { Voucher } from './Models';
 import { asyncHandler } from './expressUtils';
+import { HistoryEntry, HistoryQuery, Store } from './db';
+import { SyslogSettings, defaultSyslogSettings, sendSyslog, validateSyslogSettings } from './syslog';
+import { Auth, getUser, loadAuthConfig } from './auth';
 import path from 'path';
 import QRCode from 'qrcode';
 
@@ -71,6 +74,43 @@ const BASEPATH = process.env.BASEPATH ? process.env.BASEPATH.replace(/\/$/, "") 
 
 if (BASEPATH)
     logger.info(`Using base path: '${BASEPATH || "/"}'`);
+
+// Voucher history (SQLite) and admin settings
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const HISTORY_RETENTION_DAYS_DEFAULT = process.env.HISTORY_RETENTION_DAYS ? Number(process.env.HISTORY_RETENTION_DAYS) : 365;
+if (!Number.isInteger(HISTORY_RETENTION_DAYS_DEFAULT) || HISTORY_RETENTION_DAYS_DEFAULT < 0)
+    throw new Error(`Invalid HISTORY_RETENTION_DAYS: '${process.env.HISTORY_RETENTION_DAYS}'`);
+const store = new Store(DATA_DIR);
+
+const getRetentionDays = () => store.getSetting<number>('historyRetentionDays', HISTORY_RETENTION_DAYS_DEFAULT);
+const getSyslogSettings = (): SyslogSettings => ({ ...defaultSyslogSettings, ...store.getSetting<Partial<SyslogSettings>>('syslog', {}) });
+
+function purgeHistory() {
+    try {
+        const deleted = store.purgeHistory(getRetentionDays());
+        if (deleted > 0) logger.info({ deleted }, 'Purged expired voucher history');
+    } catch (err) {
+        logger.error({ err }, 'Failed to purge voucher history');
+    }
+}
+purgeHistory();
+setInterval(purgeHistory, 3600 * 1000).unref();
+
+// Sends an event to the syslog server configured by the admin (never blocks the request)
+function emitSyslog(msgId: string, payload: Record<string, unknown>) {
+    const settings = getSyslogSettings();
+    if (!settings.enabled) return;
+    sendSyslog(settings, msgId, payload).catch((err) => logger.error({ err }, 'Failed to send syslog event'));
+}
+
+// Liveness/readiness endpoint, reachable without login
+app.get(`${BASEPATH}/healthz`, (_, res) => {
+    res.json({ status: 'ok' });
+});
+
+// Optional OIDC login: when enabled, everything registered below requires a session
+const auth = new Auth(loadAuthConfig(process.env), BASEPATH);
+auth.install(app);
 
 // Helper to compile MJML template and generate HTML
 async function compileVoucherEmail(vouchertmp: unknown): Promise<{ html: string; error?: string }> {
@@ -148,6 +188,96 @@ app.get(`${BASEPATH}/api/config`, (_, res) => {
     res.json({ emailEnabled: EMAIL_ENABLED });
 });
 
+app.get(`${BASEPATH}/api/me`, (req, res) => {
+    const user = getUser(req);
+    res.json({
+        oidcEnabled: auth.enabled,
+        user: user ? { name: user.name, email: user.email } : null,
+        isAdmin: auth.isAdmin(user),
+    });
+});
+
+function historyQuery(req: express.Request): HistoryQuery {
+    const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+    const num = (v: unknown) => (typeof v === 'string' && v !== '' && !isNaN(Number(v)) ? Number(v) : undefined);
+    return { q: str(req.query.q), from: str(req.query.from), to: str(req.query.to), limit: num(req.query.limit), offset: num(req.query.offset) };
+}
+
+app.get(`${BASEPATH}/api/history`, auth.requireAdmin(), (req, res) => {
+    res.json(store.queryHistory(historyQuery(req)));
+});
+
+// CSV export; cells starting with = + - @ are prefixed to avoid formula injection in spreadsheets
+app.get(`${BASEPATH}/api/history.csv`, auth.requireAdmin(), (req, res) => {
+    const { items } = store.queryHistory({ ...historyQuery(req), limit: 10000, offset: 0 });
+    const cell = (v: unknown) => {
+        let s = v === null || v === undefined ? '' : String(v);
+        if (/^[=+\-@]/.test(s)) s = `'${s}`;
+        return /[",;\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = ['createdAt', 'username', 'vouchergroup', 'provider', 'validityHours', 'expiresAt', 'email', 'emailSent', 'emailError', 'operator'];
+    const lines = [header.join(','), ...items.map((e) => header.map((h) => cell(e[h as keyof HistoryEntry])).join(','))];
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="voucher-history-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send('﻿' + lines.join('\r\n'));
+});
+
+app.get(`${BASEPATH}/api/settings`, auth.requireAdmin(), (_, res) => {
+    res.json({
+        syslog: getSyslogSettings(),
+        historyRetentionDays: getRetentionDays(),
+        historyRetentionDaysDefault: HISTORY_RETENTION_DAYS_DEFAULT,
+    });
+});
+
+function parseSyslogSettings(body: unknown): SyslogSettings {
+    const b = (body ?? {}) as Partial<SyslogSettings>;
+    return {
+        ...defaultSyslogSettings,
+        enabled: b.enabled === true,
+        host: typeof b.host === 'string' ? b.host.trim() : '',
+        port: Number(b.port ?? defaultSyslogSettings.port),
+        protocol: (b.protocol ?? defaultSyslogSettings.protocol) as SyslogSettings['protocol'],
+        facility: Number(b.facility ?? defaultSyslogSettings.facility),
+        appName: typeof b.appName === 'string' && b.appName.trim() ? b.appName.trim() : defaultSyslogSettings.appName,
+        hostname: typeof b.hostname === 'string' ? b.hostname.trim() : '',
+        allowSelfSigned: b.allowSelfSigned === true,
+    };
+}
+
+app.put(`${BASEPATH}/api/settings`, auth.requireAdmin(), (req, res) => {
+    const body = (req.body ?? {}) as { syslog?: unknown; historyRetentionDays?: unknown };
+    if (body.syslog !== undefined) {
+        const syslog = parseSyslogSettings(body.syslog);
+        const error = validateSyslogSettings(syslog);
+        if (error) return res.status(400).json({ error });
+        store.setSetting('syslog', syslog);
+    }
+    if (body.historyRetentionDays !== undefined) {
+        const days = Number(body.historyRetentionDays);
+        if (!Number.isInteger(days) || days < 0) return res.status(400).json({ error: 'historyRetentionDays must be an integer >= 0' });
+        store.setSetting('historyRetentionDays', days);
+        purgeHistory();
+    }
+    const operator = getUser(req)?.name ?? null;
+    logger.info({ operator }, 'Settings updated');
+    emitSyslog('settings.updated', { event: 'settings.updated', operator });
+    res.json({ syslog: getSyslogSettings(), historyRetentionDays: getRetentionDays(), historyRetentionDaysDefault: HISTORY_RETENTION_DAYS_DEFAULT });
+});
+
+// Sends a test message with the settings from the form (not necessarily saved)
+app.post(`${BASEPATH}/api/settings/syslog/test`, auth.requireAdmin(), asyncHandler(async (req, res) => {
+    const syslog = { ...parseSyslogSettings(req.body), enabled: true };
+    const error = validateSyslogSettings(syslog);
+    if (error) return res.status(400).json({ error });
+    try {
+        await sendSyslog(syslog, 'test', { event: 'test', message: 'VoucherBox syslog test', operator: getUser(req)?.name ?? null });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(502).json({ error: (err as Error).message });
+    }
+}));
+
 app.post(`${BASEPATH}/api/createvoucher`,
     asyncHandler(async (req, res) => {
         const { email, validity = 14400, expirytime = Date.now() + 86400000 }
@@ -223,8 +353,28 @@ app.post(`${BASEPATH}/api/createvoucher`,
             // Clean up old voucher groups
             await cleanupVoucherGroups(api, provider);
 
+            // History and syslog: everything except the voucher password
+            const expirySeconds = Number(voucher.expirytime);
+            const entry = {
+                username: voucher.username,
+                vouchergroup,
+                provider: PROVIDER,
+                validityHours: Number(voucher.validity) / 3600,
+                expiresAt: expirySeconds > 0 ? new Date(expirySeconds * 1000).toISOString() : null,
+                email: email || null,
+                emailSent,
+                emailError: emailError ?? null,
+                operator: getUser(req)?.name ?? null,
+            };
+            try {
+                store.addHistory(entry);
+            } catch (err) {
+                logger.error({ err }, 'Failed to write voucher history');
+            }
+            emitSyslog('voucher.created', { event: 'voucher.created', ...entry });
+
             res.json({ success: true, voucher, qrCodeDataUrl, loginLink, emailSent, emailError });
-            logger.info({ username: voucher.username, vouchergroup, emailSent }, 'Voucher created');
+            logger.info({ username: voucher.username, vouchergroup, emailSent, operator: entry.operator }, 'Voucher created');
         } catch (err: unknown) {
             logger.error({ err }, 'Error in /api/createvoucher');
             res.status(500).json({ error: (err as Error).message });

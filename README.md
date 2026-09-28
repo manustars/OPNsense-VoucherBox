@@ -356,6 +356,46 @@ Consider including:
 
 ---
 
+# 🗂️ Voucher History
+
+Every created voucher is stored in a SQLite database in `DATA_DIR` (default `/app/data` in the container, mount a volume there): date, voucher username, voucher group, validity, expiry, email (if any), whether the email was sent, and the logged-in operator (with OIDC). **Voucher passwords are never stored.**
+
+Admins can browse, filter and export it as CSV from the **History** tab. Entries older than the retention period are deleted automatically: the default comes from `HISTORY_RETENTION_DAYS` (365) and admins can change it under **Settings** (0 = keep forever). Email addresses are personal data: choose a retention period that fits your privacy policy.
+
+---
+
+# 📜 Syslog
+
+Admins can forward events to a syslog server from **Settings** (host, port, UDP/TCP/TLS, facility, app name, hostname) and send a test message. Messages are RFC 5424 with a JSON body, e.g.:
+
+```text
+<134>1 2026-09-28T22:54:04.812Z voucherbox-vlan20 voucherbox 1 voucher.created - {"event":"voucher.created","username":"...","vouchergroup":"...","validityHours":4,"email":null,"emailSent":false,"operator":"alice"}
+```
+
+Events: `voucher.created` and `settings.updated`. The voucher password is never sent.
+
+---
+
+# 🔐 OIDC Login (Keycloak)
+
+Set `OIDC_ISSUER_URL` to enable login; without it the app has no authentication and every user is an admin, so keep it behind an authenticating reverse proxy.
+
+| Variable | Description |
+| --- | --- |
+| `OIDC_ISSUER_URL` | Issuer URL, e.g. `https://auth.example.com/realms/example` |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | Confidential client (secret optional for public clients; PKCE is always used) |
+| `PUBLIC_URL` | Public URL including the base path, e.g. `https://voucher.example.com/wifi`. Redirect URI: `<PUBLIC_URL>/auth/callback` |
+| `SESSION_SECRET` | At least 32 random characters, signs the session cookie |
+| `OIDC_USER_ROLE` | Role required to use the app (empty = any authenticated user) |
+| `OIDC_ADMIN_ROLE` | Role required for History and Settings (empty = any authenticated user) |
+| `OIDC_SCOPES` | Default `openid profile email` |
+| `SESSION_MAX_AGE_HOURS` | Default 8 |
+| `OIDC_ALLOW_SELFSIGNED_HTTPS_CERTS` | `true` to accept a self-signed IdP certificate |
+
+Roles are read from Keycloak's `realm_access.roles` and `resource_access.<client>.roles`, and from `groups` / `roles` claims. In Keycloak: create a confidential OpenID Connect client with redirect URI `<PUBLIC_URL>/auth/callback` and post-logout redirect URI `<PUBLIC_URL>/`, then create the roles and assign them to users or groups. `/healthz` stays reachable without login for health checks.
+
+---
+
 # 🛠️ Development
 
 The project consists of two main components:

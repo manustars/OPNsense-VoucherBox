@@ -54,7 +54,13 @@ EXPOSE 3000
 
 ENV BASEPATH=/wifi/
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20s \
-  CMD wget --spider -q http://localhost:3000/wifi/ || exit 1
+# Voucher history database (mount a volume here to keep it)
+ENV DATA_DIR=/app/data
+RUN mkdir -p /app/data && chown node:node /app/data
+VOLUME /app/data
 
-CMD ["node", "dist/backend/server.js"]
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20s \
+  CMD wget --spider -q http://localhost:3000${BASEPATH%/}/healthz || exit 1
+
+# node:sqlite is still flagged experimental in Node 24
+CMD ["node", "--disable-warning=ExperimentalWarning", "dist/backend/server.js"]
