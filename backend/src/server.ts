@@ -51,7 +51,12 @@ const SMTP_PASS = typeof process.env.SMTP_PASS === 'string' ? process.env.SMTP_P
 const SMTP_FROM = typeof process.env.SMTP_FROM === 'string' ? process.env.SMTP_FROM : SMTP_USER;
 const SMTP_TLS = process.env.SMTP_TLS === 'true';
 const EMAIL_TEMPLATE_PATH = typeof process.env.EMAIL_TEMPLATE_PATH === 'string' ? process.env.EMAIL_TEMPLATE_PATH : "emailtemplate.mjml";
-const HOSTNAME = typeof process.env.HOSTNAME === 'string' ? process.env.HOSTNAME : (() => { throw new Error('HOSTNAME not set'); })();
+// OPNSENSE_HOST is preferred; HOSTNAME is kept for backward compatibility (in Kubernetes HOSTNAME is the pod name)
+const OPNSENSE_HOST = process.env.OPNSENSE_HOST || process.env.HOSTNAME || (() => { throw new Error('OPNSENSE_HOST not set'); })();
+const OPNSENSE_PORT = process.env.OPNSENSE_PORT ? Number(process.env.OPNSENSE_PORT) : undefined;
+if (OPNSENSE_PORT !== undefined && !(Number.isInteger(OPNSENSE_PORT) && OPNSENSE_PORT > 0 && OPNSENSE_PORT < 65536))
+    throw new Error(`Invalid OPNSENSE_PORT: '${process.env.OPNSENSE_PORT}'`);
+const OPNSENSE_API_URL = `https://${OPNSENSE_HOST}${OPNSENSE_PORT ? `:${OPNSENSE_PORT}` : ''}/api/`;
 const API_USERNAME = typeof process.env.API_USERNAME === 'string' ? process.env.API_USERNAME : (() => { throw new Error('API_USERNAME not set'); })();
 const API_PASSWORD = typeof process.env.API_PASSWORD === 'string' ? process.env.API_PASSWORD : (() => { throw new Error('API_PASSWORD not set'); })();
 const PROVIDER = typeof process.env.PROVIDER === 'string' ? process.env.PROVIDER : 'Voucher Server';
@@ -90,7 +95,7 @@ async function compileVoucherEmail(vouchertmp: unknown): Promise<{ html: string;
 async function cleanupVoucherGroups(api: OpnsenseApi, provider: string): Promise<void> {
     let groupnames: string[];
     try {
-        groupnames = await (await api.get('captiveportal/voucher/list_voucher_groups/Voucher%20Server/')).json() as string[];
+        groupnames = await (await api.get(`captiveportal/voucher/list_voucher_groups/${provider}/`)).json() as string[];
         if (!groupnames) {
             logger.warn('No voucher groups found');
         }
@@ -119,7 +124,7 @@ app.post(`${BASEPATH}/api/createvoucher`,
         const vouchergroup = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
         const api = new OpnsenseApi(
             {
-                baseUrl: `https://${HOSTNAME}/api/`,
+                baseUrl: OPNSENSE_API_URL,
                 username: API_USERNAME,
                 password: API_PASSWORD,
                 allowSelfSigned: ALLOW_SELFSIGNED_HTTPS
