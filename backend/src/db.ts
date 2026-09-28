@@ -59,6 +59,45 @@ function toEntry(r: HistoryRow): HistoryEntry {
     };
 }
 
+export type UserRole = 'user' | 'admin';
+
+export interface LocalUser {
+    id: number;
+    username: string;
+    role: UserRole;
+    disabled: boolean;
+    failedAttempts: number;
+    lockedUntil: string | null;
+    lastLoginAt: string | null;
+    createdAt: string;
+}
+
+interface UserRow {
+    id: number;
+    username: string;
+    password_hash: string;
+    role: UserRole;
+    disabled: number;
+    failed_attempts: number;
+    locked_until: string | null;
+    last_login_at: string | null;
+    created_at: string;
+}
+
+// The password hash is never part of LocalUser: it is read only by getPasswordHash
+function toUser(r: UserRow): LocalUser {
+    return {
+        id: r.id,
+        username: r.username,
+        role: r.role,
+        disabled: r.disabled === 1,
+        failedAttempts: r.failed_attempts,
+        lockedUntil: r.locked_until,
+        lastLoginAt: r.last_login_at,
+        createdAt: r.created_at,
+    };
+}
+
 export class Store {
     private db: DatabaseSync;
 
@@ -85,6 +124,18 @@ export class Store {
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                username        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash   TEXT    NOT NULL,
+                role            TEXT    NOT NULL CHECK (role IN ('user', 'admin')),
+                disabled        INTEGER NOT NULL DEFAULT 0,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until    TEXT,
+                last_login_at   TEXT,
+                created_at      TEXT    NOT NULL,
+                updated_at      TEXT    NOT NULL
             );
         `);
         logger.info(`History database: ${file}`);
@@ -132,6 +183,70 @@ export class Store {
         const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString();
         const res = this.db.prepare('DELETE FROM voucher_history WHERE created_at < ?').run(cutoff);
         return Number(res.changes);
+    }
+
+    // --- local users ---
+
+    getUserById(id: number): LocalUser | undefined {
+        const r = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as UserRow | undefined;
+        return r && toUser(r);
+    }
+
+    getUserByUsername(username: string): LocalUser | undefined {
+        const r = this.db.prepare('SELECT * FROM users WHERE username = ?').get(username) as UserRow | undefined;
+        return r && toUser(r);
+    }
+
+    listUsers(): LocalUser[] {
+        return (this.db.prepare('SELECT * FROM users ORDER BY username COLLATE NOCASE').all() as unknown as UserRow[]).map(toUser);
+    }
+
+    countUsers(): number {
+        return (this.db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
+    }
+
+    countActiveAdmins(): number {
+        return (this.db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND disabled = 0").get() as { c: number }).c;
+    }
+
+    createUser(username: string, passwordHash: string, role: UserRole): LocalUser {
+        const now = new Date().toISOString();
+        const res = this.db.prepare('INSERT INTO users (username, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+            .run(username, passwordHash, role, now, now);
+        return this.getUserById(Number(res.lastInsertRowid))!;
+    }
+
+    updateUser(id: number, patch: { role?: UserRole; disabled?: boolean; passwordHash?: string }): void {
+        const now = new Date().toISOString();
+        if (patch.role !== undefined) this.db.prepare('UPDATE users SET role = ?, updated_at = ? WHERE id = ?').run(patch.role, now, id);
+        if (patch.disabled !== undefined) this.db.prepare('UPDATE users SET disabled = ?, updated_at = ? WHERE id = ?').run(patch.disabled ? 1 : 0, now, id);
+        if (patch.passwordHash !== undefined) {
+            // a new password also clears the lockout
+            this.db.prepare('UPDATE users SET password_hash = ?, failed_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?')
+                .run(patch.passwordHash, now, id);
+        }
+    }
+
+    deleteUser(id: number): void {
+        this.db.prepare('DELETE FROM users WHERE id = ?').run(id);
+    }
+
+    recordLoginFailure(id: number, maxAttempts: number, lockMinutes: number): void {
+        const u = this.getUserById(id);
+        if (!u) return;
+        const attempts = u.failedAttempts + 1;
+        const lockedUntil = attempts >= maxAttempts ? new Date(Date.now() + lockMinutes * 60000).toISOString() : null;
+        this.db.prepare('UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?')
+            .run(lockedUntil ? 0 : attempts, lockedUntil, id);
+    }
+
+    recordLoginSuccess(id: number): void {
+        this.db.prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ? WHERE id = ?')
+            .run(new Date().toISOString(), id);
+    }
+
+    getPasswordHash(id: number): string | undefined {
+        return (this.db.prepare('SELECT password_hash FROM users WHERE id = ?').get(id) as { password_hash: string } | undefined)?.password_hash;
     }
 
     getSetting<T>(key: string, fallback: T): T {

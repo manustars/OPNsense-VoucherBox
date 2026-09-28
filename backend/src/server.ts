@@ -108,9 +108,13 @@ app.get(`${BASEPATH}/healthz`, (_, res) => {
     res.json({ status: 'ok' });
 });
 
-// Optional OIDC login: when enabled, everything registered below requires a session
-const auth = new Auth(loadAuthConfig(process.env), BASEPATH);
+// Login (AUTH_MODE: none | local | oidc | local+oidc): when enabled, the API below requires a session
+const auth = new Auth(loadAuthConfig(process.env), BASEPATH, store);
 auth.install(app);
+auth.bootstrap().catch((err) => {
+    logger.fatal({ err }, 'Failed to create the local admin user');
+    process.exit(1);
+});
 
 // Helper to compile MJML template and generate HTML
 async function compileVoucherEmail(vouchertmp: unknown): Promise<{ html: string; error?: string }> {
@@ -191,8 +195,10 @@ app.get(`${BASEPATH}/api/config`, (_, res) => {
 app.get(`${BASEPATH}/api/me`, (req, res) => {
     const user = getUser(req);
     res.json({
-        oidcEnabled: auth.enabled,
-        user: user ? { name: user.name, email: user.email } : null,
+        authEnabled: auth.enabled,
+        authModes: auth.modes,
+        authenticated: !auth.enabled || !!user,
+        user: user ? { name: user.name, email: user.email, source: user.source } : null,
         isAdmin: auth.isAdmin(user),
     });
 });

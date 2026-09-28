@@ -376,21 +376,40 @@ Events: `voucher.created` and `settings.updated`. The voucher password is never 
 
 ---
 
-# 🔐 OIDC Login (Keycloak)
+# 🔐 Login: Local Users and OIDC (Keycloak)
 
-Set `OIDC_ISSUER_URL` to enable login; without it the app has no authentication and every user is an admin, so keep it behind an authenticating reverse proxy.
+`AUTH_MODE` selects how users sign in:
+
+| `AUTH_MODE` | Behaviour |
+| --- | --- |
+| `none` | No login, every visitor is an admin. Default when `OIDC_ISSUER_URL` is not set (backward compatible): keep it behind an authenticating reverse proxy |
+| `local` | Local users stored in the database |
+| `oidc` | OpenID Connect only (Keycloak, Authentik, ...). Default when `OIDC_ISSUER_URL` is set |
+| `local+oidc` | Both: username/password form plus a single sign-on button |
+
+Roles: **user** creates vouchers; **admin** also sees History, Settings and (with local login) Users.
+
+## Local users
+
+- On first start, `LOCAL_ADMIN_USERNAME` (default `admin`) is created as admin with `LOCAL_ADMIN_PASSWORD` (at least 10 characters). The app refuses to start in `local` mode with no users and no `LOCAL_ADMIN_PASSWORD`.
+- Later changes to `LOCAL_ADMIN_PASSWORD` are ignored, so a password changed in the UI is kept. To recover a lost password, start once with `LOCAL_ADMIN_RESET_PASSWORD=true`.
+- Admins manage users under **Users**: create, change role, disable, set a password, delete. The last active admin cannot be demoted, disabled or deleted. Users change their own password under **Account**.
+- Passwords are hashed with scrypt. After 5 failed logins an account is locked for 15 minutes, and too many failures from the same IP are throttled. Role and disabled status are checked on every request.
+- The session cookie is signed with `SESSION_SECRET`, or with a random secret generated once and stored in the database.
+
+## OIDC
 
 | Variable | Description |
 | --- | --- |
 | `OIDC_ISSUER_URL` | Issuer URL, e.g. `https://auth.example.com/realms/example` |
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | Confidential client (secret optional for public clients; PKCE is always used) |
 | `PUBLIC_URL` | Public URL including the base path, e.g. `https://voucher.example.com/wifi`. Redirect URI: `<PUBLIC_URL>/auth/callback` |
-| `SESSION_SECRET` | At least 32 random characters, signs the session cookie |
 | `OIDC_USER_ROLE` | Role required to use the app (empty = any authenticated user) |
 | `OIDC_ADMIN_ROLE` | Role required for History and Settings (empty = any authenticated user) |
 | `OIDC_SCOPES` | Default `openid profile email` |
-| `SESSION_MAX_AGE_HOURS` | Default 8 |
 | `OIDC_ALLOW_SELFSIGNED_HTTPS_CERTS` | `true` to accept a self-signed IdP certificate |
+
+Common: `SESSION_SECRET` (optional, at least 32 characters) and `SESSION_MAX_AGE_HOURS` (default 8).
 
 Roles are read from Keycloak's `realm_access.roles` and `resource_access.<client>.roles`, and from `groups` / `roles` claims. In Keycloak: create a confidential OpenID Connect client with redirect URI `<PUBLIC_URL>/auth/callback` and post-logout redirect URI `<PUBLIC_URL>/`, then create the roles and assign them to users or groups. `/healthz` stays reachable without login for health checks.
 
