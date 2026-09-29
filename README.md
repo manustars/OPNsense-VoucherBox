@@ -327,11 +327,12 @@ VoucherBox is an interface around that functionality.
 
 # 📧 Email Delivery
 
-VoucherBox can optionally send generated vouchers through SMTP.
+Email is optional. When it is off, the email field is hidden and the voucher (username, password, QR code) is shown on the page only. If sending fails, the voucher is still returned and shown with a warning.
 
-Email delivery is **optional**: it is enabled only when `SMTP_HOST` is set. Without it, the email field is hidden and the voucher (username, password, QR code) is shown on the page only. If sending fails, the voucher is still returned and shown, with a warning.
+There are two ways to configure SMTP:
 
-Configure:
+- **From the Settings page** (admins): host, port, implicit TLS, username, password, sender, BCC and subject, plus a *Send test email* button. The SMTP password is encrypted in the database with AES-256-GCM using `SETTINGS_ENCRYPTION_KEY` (at least 32 characters, kept outside the database, e.g. in a Kubernetes Secret). The API never returns it: leave the field empty to keep the stored one. Without `SETTINGS_ENCRYPTION_KEY` a password cannot be stored. If the key changes, the stored password can no longer be decrypted and must be entered again.
+- **From environment variables**: when `SMTP_HOST` is set, SMTP is managed by the deployment and shown read-only in Settings:
 
 ```dotenv
 SMTP_HOST=mail.example.com
@@ -339,20 +340,12 @@ SMTP_PORT=587
 SMTP_USER=voucher@example.com
 SMTP_PASS=...
 SMTP_FROM="WiFi Voucher <voucher@example.com>"
+SMTP_TLS=false
+EMAIL_ADMIN=admin@example.com
+EMAIL_SUBJECT=WiFi Voucher
 ```
 
-The repository contains email templates that can be customized for your organization.
-
-Consider including:
-
-* Wi-Fi network name
-* Voucher username
-* Voucher password
-* Expiration information
-* Captive Portal URL
-* QR code
-* Guest instructions
-* Support contact
+`SMTP_USER` empty = relay without authentication. The repository contains an MJML email template (`EMAIL_TEMPLATE_PATH`) that can be customized.
 
 ---
 

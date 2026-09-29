@@ -1,5 +1,4 @@
 import express from 'express';
-import nodemailer from 'nodemailer';
 import handlebars from 'handlebars';
 import mjml2html from 'mjml';
 import fs from 'fs';
@@ -11,6 +10,8 @@ import { asyncHandler } from './expressUtils';
 import { HistoryEntry, HistoryQuery, Store } from './db';
 import { SyslogSettings, defaultSyslogSettings, sendSyslog, validateSyslogSettings } from './syslog';
 import { Auth, getUser, loadAuthConfig } from './auth';
+import { EmailConfig, EmailSettings, parseEmailSettings, sendMail, validateEmailSettings } from './email';
+import { SecretBox } from './secrets';
 import path from 'path';
 import QRCode from 'qrcode';
 
@@ -45,16 +46,6 @@ export const logger = pino({
 const app = express();
 app.use(express.json());
 
-// Email delivery is optional: it is enabled only when SMTP_HOST is set
-const SMTP_HOST = process.env.SMTP_HOST || '';
-const EMAIL_ENABLED = SMTP_HOST !== '';
-const EMAIL_ADMIN = process.env.EMAIL_ADMIN || undefined;
-const EMAIL_SUBJECT = typeof process.env.EMAIL_SUBJECT === 'string' ? process.env.EMAIL_SUBJECT : 'Your Voucher Details';
-const SMTP_PORT = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : (EMAIL_ENABLED ? (() => { throw new Error('SMTP_PORT not set'); })() : 0);
-const SMTP_USER = typeof process.env.SMTP_USER === 'string' ? process.env.SMTP_USER : (EMAIL_ENABLED ? (() => { throw new Error('SMTP_USER not set'); })() : '');
-const SMTP_PASS = typeof process.env.SMTP_PASS === 'string' ? process.env.SMTP_PASS : (EMAIL_ENABLED ? (() => { throw new Error('SMTP_PASS not set'); })() : '');
-const SMTP_FROM = typeof process.env.SMTP_FROM === 'string' && process.env.SMTP_FROM !== '' ? process.env.SMTP_FROM : SMTP_USER;
-const SMTP_TLS = process.env.SMTP_TLS === 'true';
 const EMAIL_TEMPLATE_PATH = typeof process.env.EMAIL_TEMPLATE_PATH === 'string' ? process.env.EMAIL_TEMPLATE_PATH : "emailtemplate.mjml";
 // OPNSENSE_HOST is preferred; HOSTNAME is kept for backward compatibility (in Kubernetes HOSTNAME is the pod name)
 const OPNSENSE_HOST = process.env.OPNSENSE_HOST || process.env.HOSTNAME || (() => { throw new Error('OPNSENSE_HOST not set'); })();
@@ -81,6 +72,11 @@ const HISTORY_RETENTION_DAYS_DEFAULT = process.env.HISTORY_RETENTION_DAYS ? Numb
 if (!Number.isInteger(HISTORY_RETENTION_DAYS_DEFAULT) || HISTORY_RETENTION_DAYS_DEFAULT < 0)
     throw new Error(`Invalid HISTORY_RETENTION_DAYS: '${process.env.HISTORY_RETENTION_DAYS}'`);
 const store = new Store(DATA_DIR);
+
+// Email is optional: configured by SMTP_* env vars (read-only in the UI) or by an admin in Settings.
+// Secrets stored in the database (SMTP password) are encrypted with SETTINGS_ENCRYPTION_KEY.
+const secretBox = new SecretBox(process.env.SETTINGS_ENCRYPTION_KEY);
+const emailConfig = new EmailConfig(process.env, store, secretBox);
 
 const getRetentionDays = () => store.getSetting<number>('historyRetentionDays', HISTORY_RETENTION_DAYS_DEFAULT);
 const getSyslogSettings = (): SyslogSettings => ({ ...defaultSyslogSettings, ...store.getSetting<Partial<SyslogSettings>>('syslog', {}) });
@@ -162,34 +158,24 @@ async function cleanupVoucherGroups(api: OpnsenseApi, provider: string): Promise
 
 // Helper to send the voucher by email
 async function sendVoucherEmail(email: string, vouchertmp: unknown): Promise<void> {
+    const cfg = emailConfig.effective();
     // Compile MJML template and generate HTML
     const { html, error } = await compileVoucherEmail(vouchertmp);
     if (error) {
         throw new Error(error);
     }
     logger.debug({ html }, 'Prepared email HTML');
-
-    const transporter = nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        secure: SMTP_TLS,
-        auth: { user: SMTP_USER, pass: SMTP_PASS }
-    });
-
-    await transporter.sendMail({
-        from: SMTP_FROM,
-        to: email,
-        bcc: EMAIL_ADMIN,
-        subject: EMAIL_SUBJECT,
-        html
-    });
+    await sendMail(cfg, { to: email, bcc: cfg.admin || undefined, subject: cfg.subject, html });
     logger.debug({ to: email }, 'Sent voucher email');
 }
 
-logger.info(`Email delivery ${EMAIL_ENABLED ? 'enabled' : 'disabled (SMTP_HOST not set)'}`);
+logger.info(emailConfig.managedByEnv
+    ? 'Email delivery configured by environment (SMTP_HOST)'
+    : `Email delivery ${emailConfig.enabled ? 'enabled' : 'disabled'} (configured in Settings)`);
+if (!secretBox.available) logger.warn('SETTINGS_ENCRYPTION_KEY not set: the SMTP password cannot be stored from Settings');
 
 app.get(`${BASEPATH}/api/config`, (_, res) => {
-    res.json({ emailEnabled: EMAIL_ENABLED });
+    res.json({ emailEnabled: emailConfig.enabled });
 });
 
 app.get(`${BASEPATH}/api/me`, (req, res) => {
@@ -228,13 +214,21 @@ app.get(`${BASEPATH}/api/history.csv`, auth.requireAdmin(), (req, res) => {
     res.send('﻿' + lines.join('\r\n'));
 });
 
-app.get(`${BASEPATH}/api/settings`, auth.requireAdmin(), (_, res) => {
-    res.json({
-        syslog: getSyslogSettings(),
-        historyRetentionDays: getRetentionDays(),
-        historyRetentionDaysDefault: HISTORY_RETENTION_DAYS_DEFAULT,
-    });
+const settingsView = () => ({
+    syslog: getSyslogSettings(),
+    email: emailConfig.view(),
+    historyRetentionDays: getRetentionDays(),
+    historyRetentionDaysDefault: HISTORY_RETENTION_DAYS_DEFAULT,
 });
+
+app.get(`${BASEPATH}/api/settings`, auth.requireAdmin(), (_, res) => {
+    res.json(settingsView());
+});
+
+// SMTP password in a request: undefined = keep the stored one, '' = remove, string = replace
+function passwordField(v: unknown): string | undefined {
+    return typeof v === 'string' ? v : undefined;
+}
 
 function parseSyslogSettings(body: unknown): SyslogSettings {
     const b = (body ?? {}) as Partial<SyslogSettings>;
@@ -252,24 +246,69 @@ function parseSyslogSettings(body: unknown): SyslogSettings {
 }
 
 app.put(`${BASEPATH}/api/settings`, auth.requireAdmin(), (req, res) => {
-    const body = (req.body ?? {}) as { syslog?: unknown; historyRetentionDays?: unknown };
+    const body = (req.body ?? {}) as { syslog?: unknown; email?: { password?: unknown }; historyRetentionDays?: unknown };
+
+    // validate everything first, then save: a bad section must not leave a partial update
+    let syslog: SyslogSettings | undefined;
     if (body.syslog !== undefined) {
-        const syslog = parseSyslogSettings(body.syslog);
+        syslog = parseSyslogSettings(body.syslog);
         const error = validateSyslogSettings(syslog);
-        if (error) return res.status(400).json({ error });
-        store.setSetting('syslog', syslog);
+        if (error) return res.status(400).json({ error: `Syslog: ${error}` });
     }
+    let email: EmailSettings | undefined;
+    const emailPassword = passwordField(body.email?.password);
+    if (body.email !== undefined && !emailConfig.managedByEnv) {
+        email = parseEmailSettings(body.email);
+        const error = validateEmailSettings(email);
+        if (error) return res.status(400).json({ error: `Email: ${error}` });
+        if (emailPassword && !secretBox.available) {
+            return res.status(400).json({ error: 'Email: SETTINGS_ENCRYPTION_KEY is not set, the SMTP password cannot be stored' });
+        }
+    }
+    let days: number | undefined;
     if (body.historyRetentionDays !== undefined) {
-        const days = Number(body.historyRetentionDays);
+        days = Number(body.historyRetentionDays);
         if (!Number.isInteger(days) || days < 0) return res.status(400).json({ error: 'historyRetentionDays must be an integer >= 0' });
+    }
+
+    if (syslog) store.setSetting('syslog', syslog);
+    if (email) emailConfig.save(email, emailPassword);
+    if (days !== undefined) {
         store.setSetting('historyRetentionDays', days);
         purgeHistory();
     }
     const operator = getUser(req)?.name ?? null;
     logger.info({ operator }, 'Settings updated');
-    emitSyslog('settings.updated', { event: 'settings.updated', operator });
-    res.json({ syslog: getSyslogSettings(), historyRetentionDays: getRetentionDays(), historyRetentionDaysDefault: HISTORY_RETENTION_DAYS_DEFAULT });
+    emitSyslog('settings.updated', { event: 'settings.updated', operator, sections: Object.keys(body) });
+    res.json(settingsView());
 });
+
+// Sends a test email with the settings from the form (not necessarily saved); the stored password is used if none is given
+app.post(`${BASEPATH}/api/settings/email/test`, auth.requireAdmin(), asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as { to?: unknown; password?: unknown };
+    const to = typeof body.to === 'string' ? body.to.trim() : '';
+    if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(to)) return res.status(400).json({ error: 'A valid recipient is required' });
+    let cfg;
+    try {
+        const form = { ...parseEmailSettings(req.body), enabled: true };
+        const error = emailConfig.managedByEnv ? null : validateEmailSettings(form);
+        if (error) return res.status(400).json({ error });
+        cfg = emailConfig.fromForm(form, passwordField(body.password));
+    } catch (err) {
+        return res.status(400).json({ error: (err as Error).message });
+    }
+    try {
+        await sendMail(cfg, {
+            to,
+            subject: 'VoucherBox test email',
+            html: `<p>This is a test email from VoucherBox, sent by ${getUser(req)?.name ?? 'an admin'}.</p><p>SMTP: ${cfg.host}:${cfg.port}</p>`,
+        });
+        logger.info({ to, operator: getUser(req)?.name }, 'Test email sent');
+        res.json({ success: true });
+    } catch (err) {
+        res.status(502).json({ error: (err as Error).message });
+    }
+}));
 
 // Sends a test message with the settings from the form (not necessarily saved)
 app.post(`${BASEPATH}/api/settings/syslog/test`, auth.requireAdmin(), asyncHandler(async (req, res) => {
@@ -346,7 +385,7 @@ app.post(`${BASEPATH}/api/createvoucher`,
             // The voucher already exists in OPNsense: an email failure must not hide it
             let emailSent = false;
             let emailError: string | undefined;
-            if (EMAIL_ENABLED && email) {
+            if (emailConfig.enabled && email) {
                 try {
                     await sendVoucherEmail(email, vouchertmp);
                     emailSent = true;

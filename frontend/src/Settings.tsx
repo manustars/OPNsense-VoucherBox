@@ -11,8 +11,23 @@ interface SyslogSettings {
   allowSelfSigned: boolean;
 }
 
+interface EmailSettings {
+  source: 'env' | 'settings';
+  enabled: boolean;
+  host: string;
+  port: number;
+  tls: boolean;
+  user: string;
+  from: string;
+  admin: string;
+  subject: string;
+  passwordSet: boolean;
+  encryptionAvailable: boolean;
+}
+
 interface SettingsData {
   syslog: SyslogSettings;
+  email: EmailSettings;
   historyRetentionDays: number;
   historyRetentionDaysDefault: number;
 }
@@ -28,6 +43,10 @@ export default function Settings() {
   const [data, setData] = useState<SettingsData | null>(null);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  // SMTP password: empty = keep the stored one; clearPassword = remove it
+  const [smtpPassword, setSmtpPassword] = useState('');
+  const [clearPassword, setClearPassword] = useState(false);
+  const [testTo, setTestTo] = useState('');
 
   useEffect(() => {
     fetch('api/settings')
@@ -42,6 +61,10 @@ export default function Settings() {
 
   const s = data.syslog;
   const setSyslog = (patch: Partial<SyslogSettings>) => setData({ ...data, syslog: { ...s, ...patch } });
+  const m = data.email;
+  const setEmail = (patch: Partial<EmailSettings>) => setData({ ...data, email: { ...m, ...patch } });
+  const emailLocked = m.source === 'env';
+  const passwordPayload = () => (clearPassword ? '' : smtpPassword || undefined);
 
   const save = async () => {
     setBusy(true);
@@ -50,10 +73,16 @@ export default function Settings() {
       const res = await fetch('api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ syslog: s, historyRetentionDays: data.historyRetentionDays }),
+        body: JSON.stringify({
+          syslog: s,
+          ...(emailLocked ? {} : { email: { ...m, password: passwordPayload() } }),
+          historyRetentionDays: data.historyRetentionDays,
+        }),
       });
       if (!res.ok) throw new Error(await readError(res));
       setData(await res.json());
+      setSmtpPassword('');
+      setClearPassword(false);
       setMessage({ ok: true, text: 'Settings saved' });
     } catch (e) {
       setMessage({ ok: false, text: (e as Error).message });
@@ -80,8 +109,103 @@ export default function Settings() {
     }
   };
 
+  const testEmail = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const res = await fetch('api/settings/email/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...m, to: testTo, password: passwordPayload() }),
+      });
+      if (!res.ok) throw new Error(await readError(res));
+      setMessage({ ok: true, text: `Test email sent to ${testTo}` });
+    } catch (e) {
+      setMessage({ ok: false, text: `Test email failed: ${(e as Error).message}` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="max-w-2xl mx-auto mt-8 p-6 rounded-xl shadow-lg bg-white space-y-8">
+      <section className="space-y-4">
+        <h2 className="text-2xl font-bold text-gray-800">Email (SMTP)</h2>
+        {emailLocked ? (
+          <p className="text-sm text-amber-700 bg-amber-50 p-3 rounded-lg">
+            Managed by the deployment (SMTP_HOST): {m.host}:{m.port}, from {m.from || m.user}. Change it in the Helm values.
+          </p>
+        ) : (
+          <>
+            <p className="text-sm text-gray-500">When enabled, the voucher form shows an email field and the voucher is sent to the guest.</p>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={m.enabled} onChange={(e) => setEmail({ enabled: e.target.checked })} />
+              <span className="text-gray-700">Send vouchers by email</span>
+            </label>
+            <div className="grid grid-cols-3 gap-4">
+              <div className="col-span-2">
+                <label className={label}>SMTP host</label>
+                <input className={input} value={m.host} placeholder="smtp.example.com" onChange={(e) => setEmail({ host: e.target.value })} />
+              </div>
+              <div>
+                <label className={label}>Port</label>
+                <input type="number" className={input} value={m.port} onChange={(e) => setEmail({ port: Number(e.target.value) })} />
+              </div>
+              <div className="col-span-3">
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={m.tls} onChange={(e) => setEmail({ tls: e.target.checked })} />
+                  <span className="text-gray-700">Implicit TLS (port 465). Leave unchecked for STARTTLS on 587.</span>
+                </label>
+              </div>
+              <div>
+                <label className={label}>Username</label>
+                <input className={input} value={m.user} autoComplete="off" placeholder="empty = no authentication" onChange={(e) => setEmail({ user: e.target.value })} />
+              </div>
+              <div className="col-span-2">
+                <label className={label}>Password {m.passwordSet && !clearPassword && <span className="text-gray-400">(stored, leave empty to keep)</span>}</label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    className={input}
+                    value={smtpPassword}
+                    autoComplete="new-password"
+                    disabled={clearPassword || !m.encryptionAvailable}
+                    placeholder={m.passwordSet ? '••••••••' : ''}
+                    onChange={(e) => setSmtpPassword(e.target.value)}
+                  />
+                  {m.passwordSet && (
+                    <label className="flex items-center gap-1 text-sm text-gray-600 whitespace-nowrap">
+                      <input type="checkbox" checked={clearPassword} onChange={(e) => setClearPassword(e.target.checked)} /> remove
+                    </label>
+                  )}
+                </div>
+                {!m.encryptionAvailable && (
+                  <p className="text-xs text-amber-700 mt-1">SETTINGS_ENCRYPTION_KEY is not set: the password cannot be stored.</p>
+                )}
+              </div>
+              <div className="col-span-2">
+                <label className={label}>Sender (from)</label>
+                <input className={input} value={m.from} placeholder='WiFi &lt;wifi@example.com&gt; (empty = username)' onChange={(e) => setEmail({ from: e.target.value })} />
+              </div>
+              <div>
+                <label className={label}>BCC (optional)</label>
+                <input className={input} value={m.admin} placeholder="copy@example.com" onChange={(e) => setEmail({ admin: e.target.value })} />
+              </div>
+              <div className="col-span-3">
+                <label className={label}>Subject</label>
+                <input className={input} value={m.subject} onChange={(e) => setEmail({ subject: e.target.value })} />
+              </div>
+            </div>
+          </>
+        )}
+        <div className="flex gap-2">
+          <input className={input} value={testTo} placeholder="test recipient" onChange={(e) => setTestTo(e.target.value)} />
+          <button disabled={busy || !testTo || (!emailLocked && !m.host)} onClick={testEmail} className="px-4 py-2 rounded-lg border border-gray-300 hover:bg-gray-100 disabled:opacity-50 whitespace-nowrap">
+            Send test email
+          </button>
+        </div>
+      </section>
+
       <section className="space-y-4">
         <h2 className="text-2xl font-bold text-gray-800">Syslog</h2>
         <p className="text-sm text-gray-500">Each created voucher is sent as a JSON event (never the password).</p>
