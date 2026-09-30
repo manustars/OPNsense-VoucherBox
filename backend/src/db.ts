@@ -17,6 +17,9 @@ export interface HistoryEntry {
     emailSent: boolean;
     emailError: string | null;
     operator: string | null;
+    // null = no terms configured when the voucher was created
+    termsAccepted: boolean | null;
+    termsVersion: string | null;
 }
 
 export type NewHistoryEntry = Omit<HistoryEntry, 'id' | 'createdAt'>;
@@ -41,6 +44,8 @@ interface HistoryRow {
     email_sent: number;
     email_error: string | null;
     operator: string | null;
+    terms_accepted: number | null;
+    terms_version: string | null;
 }
 
 function toEntry(r: HistoryRow): HistoryEntry {
@@ -56,6 +61,8 @@ function toEntry(r: HistoryRow): HistoryEntry {
         emailSent: r.email_sent === 1,
         emailError: r.email_error,
         operator: r.operator,
+        termsAccepted: r.terms_accepted === null ? null : r.terms_accepted === 1,
+        termsVersion: r.terms_version,
     };
 }
 
@@ -138,6 +145,17 @@ export class Store {
                 updated_at      TEXT    NOT NULL
             );
         `);
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS terms_versions (
+                version    TEXT PRIMARY KEY,
+                text       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+        `);
+        // migrations for databases created by older versions
+        const columns = (this.db.prepare('PRAGMA table_info(voucher_history)').all() as { name: string }[]).map((c) => c.name);
+        if (!columns.includes('terms_accepted')) this.db.exec('ALTER TABLE voucher_history ADD COLUMN terms_accepted INTEGER');
+        if (!columns.includes('terms_version')) this.db.exec('ALTER TABLE voucher_history ADD COLUMN terms_version TEXT');
         logger.info(`History database: ${file}`);
     }
 
@@ -145,10 +163,11 @@ export class Store {
         const createdAt = new Date().toISOString();
         const res = this.db.prepare(`
             INSERT INTO voucher_history
-                (created_at, username, vouchergroup, provider, validity_hours, expires_at, email, email_sent, email_error, operator)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (created_at, username, vouchergroup, provider, validity_hours, expires_at, email, email_sent, email_error, operator, terms_accepted, terms_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(createdAt, e.username, e.vouchergroup, e.provider, e.validityHours, e.expiresAt,
-            e.email, e.emailSent ? 1 : 0, e.emailError, e.operator);
+            e.email, e.emailSent ? 1 : 0, e.emailError, e.operator,
+            e.termsAccepted === null ? null : e.termsAccepted ? 1 : 0, e.termsVersion);
         return { ...e, id: Number(res.lastInsertRowid), createdAt };
     }
 
@@ -183,6 +202,19 @@ export class Store {
         const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString();
         const res = this.db.prepare('DELETE FROM voucher_history WHERE created_at < ?').run(cutoff);
         return Number(res.changes);
+    }
+
+    // --- terms and conditions versions (the exact text accepted by a guest stays available) ---
+
+    saveTermsVersion(version: string, text: string): void {
+        this.db.prepare('INSERT OR IGNORE INTO terms_versions (version, text, created_at) VALUES (?, ?, ?)')
+            .run(version, text, new Date().toISOString());
+    }
+
+    getTermsVersion(version: string): { version: string; text: string; createdAt: string } | undefined {
+        const r = this.db.prepare('SELECT version, text, created_at FROM terms_versions WHERE version = ?').get(version) as
+            { version: string; text: string; created_at: string } | undefined;
+        return r && { version: r.version, text: r.text, createdAt: r.created_at };
     }
 
     // --- local users ---

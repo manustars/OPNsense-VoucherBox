@@ -345,7 +345,17 @@ EMAIL_ADMIN=admin@example.com
 EMAIL_SUBJECT=WiFi Voucher
 ```
 
-`SMTP_USER` empty = relay without authentication. The repository contains an MJML email template (`EMAIL_TEMPLATE_PATH`) that can be customized.
+`SMTP_USER` empty = relay without authentication.
+
+## Email content and terms
+
+Admins edit the voucher email under **Settings → Voucher email & terms**: title, introduction, instructions, signature, labels, date locale and time zone, QR code on/off and caption, optional login button. The texts are plain text with placeholders `{{username}}` `{{password}}` `{{validity}}` `{{expiryDate}}` `{{loginLink}}`: HTML is escaped and unknown placeholders are rejected. The layout is fixed and email-client friendly. There is a live preview, a *Send sample* button and *Reset to default*.
+
+- The QR code is attached as an inline image (`cid:`), because Gmail and other clients block `data:` images. Every email also has a plain-text part.
+- The login button is off by default: a link to the captive portal with the password in the URL is often flagged as phishing by spam filters.
+- **Terms and conditions**, if set, appear at the bottom of the email and on the voucher page. There the operator must confirm that the guest accepted them before a voucher can be created. The history records the acceptance and a version id of the exact text, and admins can look up that text from the History tab.
+
+Advanced: `EMAIL_TEMPLATE_PATH` points to a custom MJML/Handlebars template file that replaces the layout (variables `{{username}}`, `{{password}}`, `{{validity}}`, `{{expiryDate}}`, `{{loginLink}}`, `{{qrCode}}`).
 
 ---
 
