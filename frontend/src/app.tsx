@@ -13,7 +13,7 @@ const TABS: Tab[] = ['voucher', 'history', 'settings', 'users', 'account'];
 
 interface Me {
   authEnabled: boolean;
-  authModes: { local: boolean; oidc: boolean };
+  authModes: { local: boolean; oidc: boolean; oidcLabel?: string };
   authenticated: boolean;
   user: { name: string; email?: string; source: 'local' | 'oidc' } | null;
   isAdmin: boolean;
@@ -35,6 +35,18 @@ function App() {
       .then((m: Me) => { setMe(m); setError(null); })
       .catch((e: Error) => setError(e.message));
   }, []);
+
+  // A 401 from the API means the session expired (idle timeout, logout elsewhere): show the login again
+  useEffect(() => {
+    const original = window.fetch;
+    window.fetch = async (...args) => {
+      const res = await original(...args);
+      const url = String(args[0] instanceof Request ? args[0].url : args[0]);
+      if (res.status === 401 && url.includes('api/') && !url.includes('api/me') && !url.includes('api/login')) loadMe();
+      return res;
+    };
+    return () => { window.fetch = original; };
+  }, [loadMe]);
 
   useEffect(() => {
     loadMe();

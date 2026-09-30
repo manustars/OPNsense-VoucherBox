@@ -19,7 +19,8 @@ export default function VoucherForm() {
   const [emailEnabled, setEmailEnabled] = useState(false);
   const [emailWarning, setEmailWarning] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
-  const [terms, setTerms] = useState<{ title: string; text: string; version: string } | null>(null);
+  const [terms, setTerms] = useState<{ title: string; text: string; version: string; confirmation: boolean; confirmText: string } | null>(null);
+  const [maxValidityDays, setMaxValidityDays] = useState(7);
   const [termsAccepted, setTermsAccepted] = useState(false);
 
   useEffect(() => {
@@ -28,6 +29,7 @@ export default function VoucherForm() {
       .then(cfg => {
         setEmailEnabled(Boolean(cfg?.emailEnabled));
         setTerms(cfg?.terms ?? null);
+        if (cfg?.maxValidityDays) setMaxValidityDays(cfg.maxValidityDays);
       })
       .catch(() => setEmailEnabled(false));
   }, []);
@@ -39,11 +41,15 @@ export default function VoucherForm() {
     }
     if (!validity || validity < 1) {
       newErrors.validity = 'Validity must be at least 1 hour.';
+    } else if (validity > maxValidityDays * 24) {
+      newErrors.validity = `Validity can be at most ${maxValidityDays * 24} hours (${maxValidityDays} days).`;
     }
     if (!endDate || isNaN(new Date(endDate).getTime())) {
       newErrors.endDate = 'Please enter a valid end date.';
     } else if (new Date(endDate) < new Date()) {
       newErrors.endDate = 'End date must be in the future.';
+    } else if (new Date(endDate).getTime() - Date.now() > maxValidityDays * 86400000) {
+      newErrors.endDate = `End date must be within ${maxValidityDays} days.`;
     }
     return newErrors;
   }
@@ -75,7 +81,7 @@ export default function VoucherForm() {
           email: emailEnabled && email ? email : undefined,
           validity: validitySeconds,
           expirytime: expiryTimestamp,
-          termsAccepted: terms ? termsAccepted : undefined,
+          termsAccepted: terms?.confirmation ? termsAccepted : undefined,
         }),
       });
       if (res.ok) {
@@ -128,6 +134,7 @@ export default function VoucherForm() {
           <input
             type="number"
             min={1}
+            max={maxValidityDays * 24}
             className={`w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 ${errors.validity ? 'border-red-500' : 'border-gray-300'}`}
             value={validity}
             onChange={e => setValidity(Number(e.target.value))}
@@ -152,15 +159,17 @@ export default function VoucherForm() {
             <div className="max-h-40 overflow-y-auto whitespace-pre-wrap text-xs text-gray-600 border border-gray-200 rounded-lg p-3 bg-gray-50">
               {terms.text}
             </div>
-            <label className="flex items-start gap-2 mt-2 text-sm text-gray-700">
-              <input type="checkbox" className="mt-1" checked={termsAccepted} onChange={e => setTermsAccepted(e.target.checked)} required />
-              <span>The guest has read and accepted the terms and conditions</span>
-            </label>
+            {terms.confirmation && (
+              <label className="flex items-start gap-2 mt-2 text-sm text-gray-700">
+                <input type="checkbox" className="mt-1" checked={termsAccepted} onChange={e => setTermsAccepted(e.target.checked)} required />
+                <span>{terms.confirmText}</span>
+              </label>
+            )}
           </div>
         )}
         <button
           type="submit"
-          disabled={loading || (!!terms && !termsAccepted)}
+          disabled={loading || (!!terms?.confirmation && !termsAccepted)}
           className="w-full py-2 text-lg font-semibold rounded-lg bg-blue-500 text-white hover:bg-blue-600 transition disabled:opacity-50"
         >
           {loading ? 'Creating...' : 'Create voucher'}

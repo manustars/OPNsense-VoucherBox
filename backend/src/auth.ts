@@ -12,6 +12,9 @@ import { getDummyHash, hashPassword, validatePassword, validateUsername, verifyP
 //   local       local users stored in the database
 //   oidc        OpenID Connect (Keycloak, Authentik, ...)
 //   local+oidc  both
+//
+// Sessions are server-side: the cookie only carries a random session id, the database stores its SHA-256.
+// This gives idle timeout, absolute lifetime and real revocation (logout, password change, disabled user).
 
 export interface AuthUser {
     source: 'local' | 'oidc';
@@ -36,9 +39,12 @@ export interface AuthConfig {
     userRole: string;
     // role required for history, settings and users (empty = any authenticated user)
     adminRole: string;
+    oidcLoginLabel: string;
     // empty = generated once and stored in the database
     sessionSecret: string;
     sessionMaxAgeHours: number;
+    // 0 = no idle timeout
+    sessionIdleMinutes: number;
     allowSelfSigned: boolean;
     localAdminUsername: string;
     localAdminPassword: string;
@@ -46,10 +52,14 @@ export interface AuthConfig {
     localAdminReset: boolean;
 }
 
+export type AuditFn = (event: string, data: Record<string, unknown>) => void;
+
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_MINUTES = 15;
 const IP_WINDOW_MS = 15 * 60000;
 const IP_MAX_FAILURES = 30;
+// last_seen_at is written at most once a minute per session
+const TOUCH_INTERVAL_MS = 60000;
 
 export function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
     // Backward compatible default: OIDC if configured, otherwise no login
@@ -65,8 +75,10 @@ export function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
         scopes: env.OIDC_SCOPES || 'openid profile email',
         userRole: env.OIDC_USER_ROLE || '',
         adminRole: env.OIDC_ADMIN_ROLE || '',
+        oidcLoginLabel: env.OIDC_LOGIN_LABEL || 'Sign in with single sign-on',
         sessionSecret: env.SESSION_SECRET || '',
         sessionMaxAgeHours: env.SESSION_MAX_AGE_HOURS ? Number(env.SESSION_MAX_AGE_HOURS) : 8,
+        sessionIdleMinutes: env.SESSION_IDLE_MINUTES !== undefined && env.SESSION_IDLE_MINUTES !== '' ? Number(env.SESSION_IDLE_MINUTES) : 30,
         allowSelfSigned: env.OIDC_ALLOW_SELFSIGNED_HTTPS_CERTS === 'true',
         localAdminUsername: env.LOCAL_ADMIN_USERNAME || 'admin',
         localAdminPassword: env.LOCAL_ADMIN_PASSWORD || '',
@@ -79,6 +91,7 @@ export function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
     }
     if (cfg.sessionSecret && cfg.sessionSecret.length < 32) throw new Error('SESSION_SECRET must be at least 32 characters');
     if (!Number.isFinite(cfg.sessionMaxAgeHours) || cfg.sessionMaxAgeHours <= 0) throw new Error('Invalid SESSION_MAX_AGE_HOURS');
+    if (!Number.isFinite(cfg.sessionIdleMinutes) || cfg.sessionIdleMinutes < 0) throw new Error('Invalid SESSION_IDLE_MINUTES');
     return cfg;
 }
 
@@ -107,27 +120,30 @@ export function extractRoles(clientId: string, ...sources: Record<string, unknow
     return [...roles];
 }
 
-interface SessionData {
-    user?: AuthUser;
+// Contents of the signed cookie: only the session id and the pending OIDC login
+interface CookieData {
+    sid?: string;
     oidc?: { state: string; nonce: string; codeVerifier: string; returnTo: string };
 }
 
-function session(req: Request): SessionData {
-    return (req.session ?? {}) as SessionData;
+function cookie(req: Request): CookieData {
+    return (req.session ?? {}) as CookieData;
 }
 
-// Current user resolved by the auth middleware for this request
-const requestUsers = new WeakMap<Request, AuthUser>();
+const hashSid = (sid: string) => crypto.createHash('sha256').update(sid).digest('hex');
+
+// Current user (and session hash) resolved by the auth middleware for this request
+const requestUsers = new WeakMap<Request, { user: AuthUser; sidHash: string }>();
 
 export function getUser(req: Request): AuthUser | undefined {
-    return requestUsers.get(req);
+    return requestUsers.get(req)?.user;
 }
 
 export class Auth {
     private clientPromise?: Promise<BaseClient>;
     private ipFailures = new Map<string, { count: number; since: number }>();
 
-    constructor(private cfg: AuthConfig, private basePath: string, private store: Store) {
+    constructor(private cfg: AuthConfig, private basePath: string, private store: Store, private audit: AuditFn = () => undefined) {
         if (cfg.oidc && cfg.allowSelfSigned) {
             custom.setHttpOptionsDefaults({ agent: new https.Agent({ rejectUnauthorized: false }) });
         }
@@ -147,7 +163,11 @@ export class Auth {
     }
 
     get modes() {
-        return { local: this.cfg.local, oidc: this.cfg.oidc };
+        return { local: this.cfg.local, oidc: this.cfg.oidc, oidcLabel: this.cfg.oidc ? this.cfg.oidcLoginLabel : undefined };
+    }
+
+    get sessionPolicy() {
+        return { maxAgeHours: this.cfg.sessionMaxAgeHours, idleMinutes: this.cfg.sessionIdleMinutes };
     }
 
     // Creates the first local admin (or resets its password when LOCAL_ADMIN_RESET_PASSWORD=true)
@@ -159,8 +179,17 @@ export class Auth {
             logger.info({ user: this.cfg.localAdminUsername }, 'Created local admin user');
         } else if (this.cfg.localAdminReset) {
             this.store.updateUser(existing.id, { passwordHash: await hashPassword(this.cfg.localAdminPassword), role: 'admin', disabled: false });
+            this.store.deleteUserSessions(existing.id);
             logger.warn({ user: existing.username }, 'Local admin password reset from LOCAL_ADMIN_PASSWORD');
+            this.audit('user.password_reset', { user: existing.username, by: 'LOCAL_ADMIN_RESET_PASSWORD' });
         }
+    }
+
+    // Deletes expired and idle sessions (called periodically)
+    purgeSessions(): void {
+        const idleMs = this.cfg.sessionIdleMinutes > 0 ? this.cfg.sessionIdleMinutes * 60000 : 365 * 86400000;
+        const n = this.store.purgeSessions(new Date(Date.now() - idleMs).toISOString());
+        if (n > 0) logger.debug({ n }, 'Purged expired sessions');
     }
 
     private get redirectUri(): string {
@@ -201,15 +230,39 @@ export class Auth {
         return secret;
     }
 
-    // Local sessions are re-validated against the database on every request
-    private resolveUser(req: Request): AuthUser | undefined {
-        const u = session(req).user;
-        if (!u) return undefined;
-        if (u.source === 'oidc') return this.cfg.oidc ? u : undefined;
-        if (!this.cfg.local || u.localId === undefined) return undefined;
-        const local = this.store.getUserById(u.localId);
-        if (!local || local.disabled) return undefined;
-        return { ...u, name: local.username, roles: [local.role], admin: local.role === 'admin' };
+    private startSession(req: Request, user: AuthUser): void {
+        const sid = crypto.randomBytes(32).toString('base64url');
+        const expires = new Date(Date.now() + this.cfg.sessionMaxAgeHours * 3600 * 1000).toISOString();
+        this.store.createSession(hashSid(sid), JSON.stringify(user), user.localId ?? null, expires, req.ip ?? null, String(req.headers['user-agent'] ?? '').slice(0, 200) || null);
+        cookie(req).sid = sid;
+    }
+
+    // Looks up the server-side session; local users are re-validated against the database on every request
+    private resolveUser(req: Request): { user: AuthUser; sidHash: string } | undefined {
+        const sid = cookie(req).sid;
+        if (!sid) return undefined;
+        const sidHash = hashSid(sid);
+        const row = this.store.getSession(sidHash);
+        if (!row) return undefined;
+        const now = Date.now();
+        const idleExpired = this.cfg.sessionIdleMinutes > 0 && now - new Date(row.last_seen_at).getTime() > this.cfg.sessionIdleMinutes * 60000;
+        if (new Date(row.expires_at).getTime() < now || idleExpired) {
+            this.store.deleteSession(sidHash);
+            return undefined;
+        }
+        let user = JSON.parse(row.user_json) as AuthUser;
+        if (user.source === 'oidc' && !this.cfg.oidc) return undefined;
+        if (user.source === 'local') {
+            if (!this.cfg.local || user.localId === undefined) return undefined;
+            const local = this.store.getUserById(user.localId);
+            if (!local || local.disabled) {
+                this.store.deleteSession(sidHash);
+                return undefined;
+            }
+            user = { ...user, name: local.username, roles: [local.role], admin: local.role === 'admin' };
+        }
+        if (now - new Date(row.last_seen_at).getTime() > TOUCH_INTERVAL_MS) this.store.touchSession(sidHash);
+        return { user, sidHash };
     }
 
     private ipBlocked(ip: string): boolean {
@@ -230,9 +283,8 @@ export class Auth {
             logger.warn('Authentication disabled (AUTH_MODE=none): every visitor is an admin');
             return;
         }
-        logger.info(`Authentication: ${[this.cfg.local && 'local users', this.cfg.oidc && `OIDC (${this.cfg.issuerUrl})`].filter(Boolean).join(' + ')}`);
+        logger.info(`Authentication: ${[this.cfg.local && 'local users', this.cfg.oidc && `OIDC (${this.cfg.issuerUrl})`].filter(Boolean).join(' + ')}; session ${this.cfg.sessionMaxAgeHours}h max, ${this.cfg.sessionIdleMinutes || 'no'} min idle`);
 
-        app.set('trust proxy', true);
         app.use(cookieSession({
             name: 'voucherbox_session',
             keys: [this.sessionSecret()],
@@ -246,11 +298,11 @@ export class Auth {
         // Resolve the user; API calls (except login/me) need a session. Pages and assets are public,
         // the frontend shows the login form when /api/me says the user is not authenticated.
         app.use((req: Request, res: Response, next: NextFunction) => {
-            const user = this.resolveUser(req);
-            if (user) requestUsers.set(req, user);
-            else if (session(req).user) req.session = null;
+            const resolved = this.resolveUser(req);
+            if (resolved) requestUsers.set(req, resolved);
+            else if (cookie(req).sid) delete cookie(req).sid;
             const open = [`${base}/api/me`, `${base}/api/login`];
-            if (req.path.startsWith(`${base}/api/`) && !open.includes(req.path) && !user) {
+            if (req.path.startsWith(`${base}/api/`) && !open.includes(req.path) && !resolved) {
                 return res.status(401).json({ error: 'Not authenticated' });
             }
             next();
@@ -260,7 +312,12 @@ export class Auth {
         if (this.cfg.oidc) this.installOidc(app);
 
         app.post(`${base}/auth/logout`, async (req, res) => {
-            const wasOidc = session(req).user?.source === 'oidc';
+            const current = requestUsers.get(req);
+            const wasOidc = current?.user.source === 'oidc';
+            if (current) {
+                this.store.deleteSession(current.sidHash);
+                this.audit('auth.logout', { user: current.user.name, ip: req.ip });
+            }
             req.session = null;
             let logoutUrl = `${base}/`;
             if (wasOidc) {
@@ -270,10 +327,19 @@ export class Auth {
                         logoutUrl = client.endSessionUrl({ post_logout_redirect_uri: `${this.cfg.publicUrl}/`, client_id: this.cfg.clientId });
                     }
                 } catch {
-                    // IdP not reachable: the local session is cleared anyway
+                    // IdP not reachable: the local session is revoked anyway
                 }
             }
             res.json({ logoutUrl });
+        });
+
+        // Signs out every other session of the current local user
+        app.post(`${base}/api/account/logout-others`, (req, res) => {
+            const current = requestUsers.get(req);
+            if (current?.user.localId === undefined) return res.status(400).json({ error: 'Only local users can do this' });
+            const revoked = this.store.deleteUserSessions(current.user.localId, current.sidHash);
+            this.audit('auth.sessions_revoked', { user: current.user.name, revoked, by: current.user.name });
+            res.json({ revoked });
         });
     }
 
@@ -287,10 +353,12 @@ export class Auth {
                 return res.status(400).json({ error: 'Username and password are required' });
             }
             if (this.ipBlocked(ip)) {
+                this.audit('auth.login_throttled', { user: username, ip });
                 return res.status(429).json({ error: 'Too many failed logins, try again later' });
             }
             const user = this.store.getUserByUsername(username);
             if (user?.lockedUntil && new Date(user.lockedUntil) > new Date()) {
+                this.audit('auth.login_locked', { user: user.username, ip });
                 return res.status(429).json({ error: `Account locked after too many failed logins, try again in ${LOCK_MINUTES} minutes` });
             }
             const hash = user ? this.store.getPasswordHash(user.id)! : await getDummyHash();
@@ -299,16 +367,19 @@ export class Auth {
                 this.ipFailed(ip);
                 if (user && !ok) this.store.recordLoginFailure(user.id, MAX_FAILED_ATTEMPTS, LOCK_MINUTES);
                 logger.warn({ user: username, ip }, 'Local login failed');
+                this.audit('auth.login_failed', { user: username, ip, reason: !user ? 'unknown user' : user.disabled && ok ? 'disabled' : 'wrong password' });
                 return res.status(401).json({ error: 'Invalid username or password' });
             }
             this.store.recordLoginSuccess(user.id);
-            session(req).user = { source: 'local', sub: `local:${user.id}`, name: user.username, roles: [user.role], admin: user.role === 'admin', localId: user.id };
+            this.startSession(req, { source: 'local', sub: `local:${user.id}`, name: user.username, roles: [user.role], admin: user.role === 'admin', localId: user.id });
             logger.info({ user: user.username }, 'User logged in (local)');
+            this.audit('auth.login', { user: user.username, source: 'local', ip });
             res.json({ success: true });
         }));
 
         app.post(`${base}/api/account/password`, asyncHandler(async (req, res) => {
-            const user = getUser(req);
+            const current = requestUsers.get(req);
+            const user = current?.user;
             if (user?.source !== 'local' || user.localId === undefined) return res.status(400).json({ error: 'Only local users can change their password here' });
             const { currentPassword, newPassword } = (req.body ?? {}) as { currentPassword?: unknown; newPassword?: unknown };
             const hash = this.store.getPasswordHash(user.localId);
@@ -318,15 +389,18 @@ export class Auth {
             const err = validatePassword(newPassword);
             if (err) return res.status(400).json({ error: err });
             this.store.updateUser(user.localId, { passwordHash: await hashPassword(newPassword as string) });
+            // a new password signs out every other session of this user
+            const revoked = this.store.deleteUserSessions(user.localId, current!.sidHash);
             logger.info({ user: user.name }, 'Password changed');
-            res.json({ success: true });
+            this.audit('user.password_changed', { user: user.name, by: user.name, sessionsRevoked: revoked });
+            res.json({ success: true, sessionsRevoked: revoked });
         }));
 
         // --- user management (admins) ---
         const admin = this.requireAdmin();
 
         app.get(`${base}/api/users`, admin, (_, res) => {
-            res.json(this.store.listUsers());
+            res.json(this.store.listUsers().map((u) => ({ ...u, activeSessions: this.store.countUserSessions(u.id) })));
         });
 
         app.post(`${base}/api/users`, admin, asyncHandler(async (req, res) => {
@@ -336,6 +410,7 @@ export class Auth {
             if (this.store.getUserByUsername(username as string)) return res.status(409).json({ error: 'Username already exists' });
             const created = this.store.createUser(username as string, await hashPassword(password as string), role as UserRole);
             logger.info({ user: created.username, role: created.role, by: getUser(req)?.name }, 'User created');
+            this.audit('user.created', { user: created.username, role: created.role, by: getUser(req)?.name });
             res.status(201).json(created);
         }));
 
@@ -359,9 +434,22 @@ export class Auth {
                 disabled: disabled as boolean | undefined,
                 passwordHash: password !== undefined ? await hashPassword(password as string) : undefined,
             });
+            // disabling or a password set by an admin signs the user out everywhere
+            const revoked = disabled === true || password !== undefined ? this.store.deleteUserSessions(id) : 0;
             logger.info({ user: target.username, role, disabled, passwordReset: password !== undefined, by: me?.name }, 'User updated');
+            this.audit('user.updated', { user: target.username, role, disabled, passwordReset: password !== undefined, sessionsRevoked: revoked, by: me?.name });
             res.json(this.store.getUserById(id));
         }));
+
+        app.delete(`${base}/api/users/:id/sessions`, admin, (req, res) => {
+            const id = Number(req.params.id);
+            const target = this.store.getUserById(id);
+            if (!target) return res.status(404).json({ error: 'User not found' });
+            const current = requestUsers.get(req);
+            const revoked = this.store.deleteUserSessions(id, current?.user.localId === id ? current.sidHash : undefined);
+            this.audit('auth.sessions_revoked', { user: target.username, revoked, by: getUser(req)?.name });
+            res.json({ revoked });
+        });
 
         app.delete(`${base}/api/users/:id`, admin, (req, res) => {
             const id = Number(req.params.id);
@@ -372,8 +460,10 @@ export class Auth {
             if (target.role === 'admin' && !target.disabled && this.store.countActiveAdmins() <= 1) {
                 return res.status(400).json({ error: 'At least one active admin is required' });
             }
+            this.store.deleteUserSessions(id);
             this.store.deleteUser(id);
             logger.info({ user: target.username, by: me?.name }, 'User deleted');
+            this.audit('user.deleted', { user: target.username, by: me?.name });
             res.status(204).end();
         });
     }
@@ -388,7 +478,7 @@ export class Auth {
                 const nonce = generators.nonce();
                 const codeVerifier = generators.codeVerifier();
                 const returnTo = typeof req.query.returnTo === 'string' && req.query.returnTo.startsWith(`${base}/`) ? req.query.returnTo : `${base}/`;
-                session(req).oidc = { state, nonce, codeVerifier, returnTo };
+                cookie(req).oidc = { state, nonce, codeVerifier, returnTo };
                 res.redirect(client.authorizationUrl({
                     scope: this.cfg.scopes,
                     redirect_uri: this.redirectUri,
@@ -404,7 +494,7 @@ export class Auth {
         });
 
         app.get(`${base}/auth/callback`, async (req, res) => {
-            const pending = session(req).oidc;
+            const pending = cookie(req).oidc;
             if (!pending) return res.redirect(`${base}/auth/login`);
             try {
                 const client = await this.client();
@@ -424,14 +514,16 @@ export class Auth {
                     roles,
                     admin,
                 };
-                delete session(req).oidc;
+                delete cookie(req).oidc;
                 if (this.cfg.userRole && !roles.includes(this.cfg.userRole) && !admin) {
                     logger.warn({ user: user.name }, 'Login denied: missing required role');
+                    this.audit('auth.login_failed', { user: user.name, source: 'oidc', ip: req.ip, reason: 'missing role' });
                     req.session = null;
                     return res.status(403).send(`Access denied: role "${this.cfg.userRole}" required.`);
                 }
-                session(req).user = user;
+                this.startSession(req, user);
                 logger.info({ user: user.name }, 'User logged in (OIDC)');
+                this.audit('auth.login', { user: user.name, source: 'oidc', ip: req.ip });
                 res.redirect(pending.returnTo);
             } catch (err) {
                 logger.error({ err }, 'OIDC callback failed');

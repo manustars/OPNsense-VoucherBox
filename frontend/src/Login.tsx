@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { FaWifi } from 'react-icons/fa';
 
 interface Props {
-  modes: { local: boolean; oidc: boolean };
+  modes: { local: boolean; oidc: boolean; oidcLabel?: string };
   onLoggedIn: () => void;
 }
 
@@ -60,7 +60,7 @@ export default function Login({ modes, onLoggedIn }: Props) {
       {modes.local && modes.oidc && <div className="my-4 text-center text-sm text-gray-400">or</div>}
       {modes.oidc && (
         <a href={oidcLogin} className="block w-full py-2 text-center font-semibold rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100">
-          Sign in with single sign-on
+          {modes.oidcLabel || 'Sign in with single sign-on'}
         </a>
       )}
     </div>

@@ -418,6 +418,21 @@ Roles are read from Keycloak's `realm_access.roles` and `resource_access.<client
 
 ---
 
+# 🛡️ Security features
+
+- **Sessions** are server-side. The cookie (HttpOnly, SameSite=Lax, Secure when `PUBLIC_URL` is https) only carries a random id, and the database stores its SHA-256. Sessions expire after `SESSION_IDLE_MINUTES` of inactivity (default 30, 0 = off) and after `SESSION_MAX_AGE_HOURS` (default 8). Logout revokes the session on the server. A password change signs out the user's other sessions. Disabling a user or resetting their password signs them out everywhere. Users can *sign out other sessions*, and admins can sign out a user.
+- **Security headers** (helmet): Content-Security-Policy, `frame-ancestors 'none'`, nosniff, `Referrer-Policy: no-referrer`, and HSTS with https. `X-Powered-By` is removed.
+- **CSRF**: besides SameSite cookies, state-changing requests with a foreign `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected.
+- **Limits** (admin *Settings*, 0 = unlimited), counted from the history: vouchers per user per hour and per day, voucher emails per user per hour, emails to the same address per day, vouchers per instance per day, and maximum validity in days. Default values: 10 / 50 / 10 / 2 / 150 / 7. Exceeding one returns 429 and a `voucher.rate_limited` syslog event.
+- **Server-side validation** of validity, end date and recipient email.
+- **Audit events** to syslog: `auth.login`, `auth.login_failed`, `auth.login_locked`, `auth.login_throttled`, `auth.logout`, `auth.sessions_revoked`, `user.created`, `user.updated`, `user.deleted`, `user.password_changed`, `settings.updated`, `voucher.created` and `voucher.rate_limited`. They never include passwords.
+- `TRUST_PROXY` (default `1`): the number of reverse proxies in front of the app, used to read the client IP from `X-Forwarded-For`. Set it to `false` when the app is exposed directly.
+- `OIDC_LOGIN_LABEL` sets the text of the single sign-on button.
+
+Terms and conditions: the version shown or sent is always recorded. An optional operator confirmation (*Settings*, editable text) can be required before creating a voucher. The guest's own acceptance belongs on the OPNsense captive portal login page.
+
+---
+
 # 🛠️ Development
 
 The project consists of two main components:
