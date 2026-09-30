@@ -165,8 +165,8 @@ async function sendVoucherEmail(email: string, vouchertmp: unknown): Promise<voi
         throw new Error(error);
     }
     logger.debug({ html }, 'Prepared email HTML');
-    await sendMail(cfg, { to: email, bcc: cfg.admin || undefined, subject: cfg.subject, html });
-    logger.debug({ to: email }, 'Sent voucher email');
+    const result = await sendMail(cfg, { to: email, bcc: cfg.admin || undefined, subject: cfg.subject, html });
+    logger.info({ to: email, ...result }, 'Voucher email accepted by the SMTP server');
 }
 
 logger.info(emailConfig.managedByEnv
@@ -298,13 +298,13 @@ app.post(`${BASEPATH}/api/settings/email/test`, auth.requireAdmin(), asyncHandle
         return res.status(400).json({ error: (err as Error).message });
     }
     try {
-        await sendMail(cfg, {
+        const result = await sendMail(cfg, {
             to,
             subject: 'VoucherBox test email',
             html: `<p>This is a test email from VoucherBox, sent by ${getUser(req)?.name ?? 'an admin'}.</p><p>SMTP: ${cfg.host}:${cfg.port}</p>`,
         });
-        logger.info({ to, operator: getUser(req)?.name }, 'Test email sent');
-        res.json({ success: true });
+        logger.info({ to, operator: getUser(req)?.name, ...result }, 'Test email accepted by the SMTP server');
+        res.json({ success: true, ...result });
     } catch (err) {
         res.status(502).json({ error: (err as Error).message });
     }

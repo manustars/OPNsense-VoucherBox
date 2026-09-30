@@ -137,17 +137,52 @@ export function parseEmailSettings(body: unknown): EmailSettings {
 
 const EMAIL_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 
+export interface Sender {
+    name: string;
+    address: string;
+}
+
+// Resolves the sender from the "from" field and the SMTP user:
+//   "wifi@example.com" | "WiFi <wifi@example.com>" -> as given
+//   "WiFi Voucher" (name only)                      -> name + SMTP user as address
+//   ""                                              -> SMTP user
+// Returns null when no valid address can be found: nodemailer would then send a message
+// without From header and with an empty envelope sender, which receivers like Gmail reject.
+export function resolveSender(from: string, user: string): Sender | null {
+    const f = from.trim();
+    const angle = f.match(/^(.*)<([^<>]+)>\s*$/);
+    if (angle) {
+        const address = angle[2].trim();
+        return EMAIL_RE.test(address) ? { name: angle[1].trim().replace(/^"(.*)"$/, '$1'), address } : null;
+    }
+    if (EMAIL_RE.test(f)) return { name: '', address: f };
+    const fallback = user.trim();
+    if (!EMAIL_RE.test(fallback)) return null;
+    return { name: f.replace(/^"(.*)"$/, '$1'), address: fallback };
+}
+
 export function validateEmailSettings(s: EmailSettings): string | null {
     if (!s.enabled) return null;
     if (!s.host) return 'SMTP host is required';
     if (!Number.isInteger(s.port) || s.port < 1 || s.port > 65535) return 'SMTP port must be between 1 and 65535';
-    if (!s.from && !s.user) return 'Sender (from) or SMTP user is required';
+    if (!resolveSender(s.from, s.user)) {
+        return 'Sender needs an email address: use "name@domain", "Name <name@domain>", or a name only with an SMTP username that is an email address';
+    }
     if (s.admin && !EMAIL_RE.test(s.admin)) return 'BCC address is not a valid email';
     if (s.subject.length > 200) return 'Subject is too long';
     return null;
 }
 
-export async function sendMail(cfg: EffectiveEmail, message: { to: string; subject: string; html: string; bcc?: string }): Promise<void> {
+export interface SendResult {
+    messageId: string;
+    // SMTP server reply, e.g. "250 2.0.0 Ok: queued as 0E8324000204"
+    response: string;
+    sender: string;
+}
+
+export async function sendMail(cfg: EffectiveEmail, message: { to: string; subject: string; html: string; bcc?: string }): Promise<SendResult> {
+    const sender = resolveSender(cfg.from, cfg.user);
+    if (!sender) throw new Error('Invalid sender: the "from" field or the SMTP username must contain an email address');
     const transporter = nodemailer.createTransport({
         host: cfg.host,
         port: cfg.port,
@@ -158,11 +193,18 @@ export async function sendMail(cfg: EffectiveEmail, message: { to: string; subje
         greetingTimeout: 10000,
         socketTimeout: 20000,
     });
-    await transporter.sendMail({
-        from: cfg.from || cfg.user,
+    const info = await transporter.sendMail({
+        from: sender,
+        // explicit envelope: never an empty MAIL FROM
+        envelope: { from: sender.address, to: [message.to, ...(message.bcc ? [message.bcc] : [])] },
         to: message.to,
         bcc: message.bcc,
         subject: message.subject,
         html: message.html,
     });
+    return {
+        messageId: info.messageId,
+        response: info.response,
+        sender: sender.name ? `${sender.name} <${sender.address}>` : sender.address,
+    };
 }
