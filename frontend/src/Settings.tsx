@@ -119,7 +119,9 @@ export default function Settings() {
         body: JSON.stringify({ ...m, to: testTo, password: passwordPayload() }),
       });
       if (!res.ok) throw new Error(await readError(res));
-      setMessage({ ok: true, text: `Test email sent to ${testTo}` });
+      const r = await res.json();
+      // "accepted" only means the SMTP server queued it: delivery can still fail later (check the mail server logs)
+      setMessage({ ok: true, text: `Accepted by the SMTP server for ${testTo}, from ${r.sender}. Server reply: ${r.response}. Message-ID: ${r.messageId}` });
     } catch (e) {
       setMessage({ ok: false, text: `Test email failed: ${(e as Error).message}` });
     } finally {
@@ -185,7 +187,7 @@ export default function Settings() {
               </div>
               <div className="col-span-2">
                 <label className={label}>Sender (from)</label>
-                <input className={input} value={m.from} placeholder='WiFi &lt;wifi@example.com&gt; (empty = username)' onChange={(e) => setEmail({ from: e.target.value })} />
+                <input className={input} value={m.from} placeholder='WiFi &lt;wifi@example.com&gt;, or a name only (address = username)' onChange={(e) => setEmail({ from: e.target.value })} />
               </div>
               <div>
                 <label className={label}>BCC (optional)</label>
