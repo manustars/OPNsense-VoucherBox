@@ -225,12 +225,19 @@ async function sendVoucherEmail(to: string, content: EmailContent, values: Vouch
     logger.info({ to, ...result }, 'Voucher email accepted by the SMTP server');
 }
 
+// Captive portal login link used by the QR code and the login button. OPNsense vouchers can contain
+// characters like ? % & # [ ) that must be URL-encoded, otherwise the portal receives wrong credentials.
+function buildLoginLink(username: string, password: string): string {
+    const params = new URLSearchParams({ username, password, redirurl: 'www.msftconnecttest.com/redirect' });
+    return `${CAPTIVE_PORTAL_URL.replace(/\/$/, '')}/index.html?${params.toString()}`;
+}
+
 const SAMPLE_VALUES = (c: EmailContent): VoucherValues => ({
     username: 'ab12cd34',
     password: 'Xy7kP2qR',
     validity: '4',
     expiryDate: formatDate(new Date(Date.now() + 4 * 3600 * 1000), c),
-    loginLink: `${CAPTIVE_PORTAL_URL.replace(/\/$/, '')}/index.html?username=ab12cd34&password=Xy7kP2qR`,
+    loginLink: buildLoginLink('ab12cd34', 'Xy7kP2qR'),
 });
 
 const getLimits = (): Limits => ({ ...defaultLimits, ...store.getSetting<Partial<Limits>>('limits', {}) });
@@ -535,7 +542,7 @@ app.post(`${BASEPATH}/api/createvoucher`,
             const voucher = vouchers[0];
 
             // Generate login link and QR code
-            const loginLink = `${CAPTIVE_PORTAL_URL}/index.html?username=${voucher.username}&password=${voucher.password}&redirurl=www.msftconnecttest.com/redirect`;
+            const loginLink = buildLoginLink(voucher.username, voucher.password);
             let qrCodeDataUrl = '';
             let qrPng: Buffer | null = null;
             try {
