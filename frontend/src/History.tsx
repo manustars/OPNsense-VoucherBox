@@ -12,12 +12,22 @@ interface HistoryEntry {
   emailSent: boolean;
   emailError: string | null;
   operator: string | null;
+  termsAccepted: boolean | null;
+  termsVersion: string | null;
 }
 
 const PAGE_SIZE = 50;
 
 function fmt(iso: string | null) {
   return iso ? new Date(iso).toLocaleString() : '—';
+}
+
+async function showTerms(version: string) {
+  const res = await fetch(`api/terms/${encodeURIComponent(version)}`);
+  const t = res.ok ? await res.json() : null;
+  window.alert(t ? `Terms version ${t.version} (${new Date(t.createdAt).toLocaleString()})
+
+${t.text}` : 'Terms version not found');
 }
 
 export default function History() {
@@ -73,6 +83,7 @@ export default function History() {
               <th className="py-2 pr-3">Email</th>
               <th className="py-2 pr-3">Sent</th>
               <th className="py-2 pr-3">Operator</th>
+              <th className="py-2 pr-3">Terms</th>
             </tr>
           </thead>
           <tbody>
@@ -87,10 +98,17 @@ export default function History() {
                   {e.email ? (e.emailSent ? '✔' : <span className="text-amber-600">✘</span>) : '—'}
                 </td>
                 <td className="py-2 pr-3">{e.operator ?? '—'}</td>
+                <td className="py-2 pr-3">
+                  {e.termsVersion ? (
+                    <button className="text-blue-600 hover:underline" title="Show the accepted text" onClick={() => showTerms(e.termsVersion!)}>
+                      {e.termsAccepted ? '✔' : '✘'} {e.termsVersion.slice(0, 6)}
+                    </button>
+                  ) : '—'}
+                </td>
               </tr>
             ))}
             {data.items.length === 0 && (
-              <tr><td colSpan={7} className="py-6 text-center text-gray-400">No vouchers</td></tr>
+              <tr><td colSpan={8} className="py-6 text-center text-gray-400">No vouchers</td></tr>
             )}
           </tbody>
         </table>

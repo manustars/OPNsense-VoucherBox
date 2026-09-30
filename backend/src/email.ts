@@ -180,7 +180,16 @@ export interface SendResult {
     sender: string;
 }
 
-export async function sendMail(cfg: EffectiveEmail, message: { to: string; subject: string; html: string; bcc?: string }): Promise<SendResult> {
+export interface InlineImage {
+    cid: string;
+    filename: string;
+    content: Buffer;
+}
+
+export async function sendMail(
+    cfg: EffectiveEmail,
+    message: { to: string; subject: string; html: string; text?: string; bcc?: string; inlineImages?: InlineImage[] },
+): Promise<SendResult> {
     const sender = resolveSender(cfg.from, cfg.user);
     if (!sender) throw new Error('Invalid sender: the "from" field or the SMTP username must contain an email address');
     const transporter = nodemailer.createTransport({
@@ -201,6 +210,9 @@ export async function sendMail(cfg: EffectiveEmail, message: { to: string; subje
         bcc: message.bcc,
         subject: message.subject,
         html: message.html,
+        text: message.text,
+        // inline images (e.g. the QR code) referenced as src="cid:..."; data: URLs are blocked by Gmail
+        attachments: message.inlineImages?.map((img) => ({ filename: img.filename, content: img.content, cid: img.cid, contentDisposition: 'inline' as const })),
     });
     return {
         messageId: info.messageId,

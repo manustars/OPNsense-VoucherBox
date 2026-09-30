@@ -12,6 +12,7 @@ import { SyslogSettings, defaultSyslogSettings, sendSyslog, validateSyslogSettin
 import { Auth, getUser, loadAuthConfig } from './auth';
 import { EmailConfig, EmailSettings, parseEmailSettings, sendMail, validateEmailSettings } from './email';
 import { SecretBox } from './secrets';
+import { EmailContent, PLACEHOLDERS, RenderedEmail, VoucherValues, defaultEmailContent, formatDate, parseEmailContent, renderVoucherEmail, termsVersion, validateEmailContent } from './emailContent';
 import path from 'path';
 import QRCode from 'qrcode';
 
@@ -46,7 +47,8 @@ export const logger = pino({
 const app = express();
 app.use(express.json());
 
-const EMAIL_TEMPLATE_PATH = typeof process.env.EMAIL_TEMPLATE_PATH === 'string' ? process.env.EMAIL_TEMPLATE_PATH : "emailtemplate.mjml";
+// Advanced: a custom MJML/Handlebars file replaces the email content edited in Settings
+const EMAIL_TEMPLATE_PATH = process.env.EMAIL_TEMPLATE_PATH || '';
 // OPNSENSE_HOST is preferred; HOSTNAME is kept for backward compatibility (in Kubernetes HOSTNAME is the pod name)
 const OPNSENSE_HOST = process.env.OPNSENSE_HOST || process.env.HOSTNAME || (() => { throw new Error('OPNSENSE_HOST not set'); })();
 const OPNSENSE_PORT = process.env.OPNSENSE_PORT ? Number(process.env.OPNSENSE_PORT) : undefined;
@@ -112,25 +114,21 @@ auth.bootstrap().catch((err) => {
     process.exit(1);
 });
 
-// Helper to compile MJML template and generate HTML
-async function compileVoucherEmail(vouchertmp: unknown): Promise<{ html: string; error?: string }> {
-    let mjmlSource;
-    try {
-        mjmlSource = fs.readFileSync(EMAIL_TEMPLATE_PATH, 'utf8');
-    } catch {
-        return { html: '', error: 'Failed to read MJML template file' };
-    }
-    let mjmlCompiled;
-    try {
-        mjmlCompiled = handlebars.compile(mjmlSource)(vouchertmp);
-    } catch {
-        return { html: '', error: 'Failed to compile MJML template with variables' };
-    }
-    const { html, errors } = await mjml2html(mjmlCompiled);
-    if (errors && errors.length > 0) {
-        return { html: '', error: 'MJML compilation error: ' + JSON.stringify(errors) };
-    }
-    return { html };
+const getEmailContent = (): EmailContent => ({ ...defaultEmailContent, ...store.getSetting<Partial<EmailContent>>('emailContent', {}) });
+
+const QR_CID = 'voucher-qr@voucherbox';
+
+// Legacy: custom MJML file with Handlebars variables (EMAIL_TEMPLATE_PATH)
+async function renderLegacyTemplate(values: VoucherValues, qrSrc: string): Promise<RenderedEmail> {
+    const source = fs.readFileSync(EMAIL_TEMPLATE_PATH, 'utf8');
+    const compiled = handlebars.compile(source)({ ...values, qrCodeDataUrl: qrSrc, qrCode: qrSrc });
+    const { html, errors } = await mjml2html(compiled);
+    if (errors && errors.length > 0) throw new Error('MJML compilation error: ' + JSON.stringify(errors));
+    return { html, text: '' };
+}
+
+async function renderEmail(content: EmailContent, values: VoucherValues, qrSrc: string | null): Promise<RenderedEmail> {
+    return EMAIL_TEMPLATE_PATH ? renderLegacyTemplate(values, qrSrc ?? '') : renderVoucherEmail(content, values, qrSrc);
 }
 
 // Helper to clean up voucher groups
@@ -156,17 +154,33 @@ async function cleanupVoucherGroups(api: OpnsenseApi, provider: string): Promise
     }
 }
 
-// Helper to send the voucher by email
-async function sendVoucherEmail(email: string, vouchertmp: unknown): Promise<void> {
+// Helper to send the voucher by email; the QR code is an inline attachment (cid:), Gmail blocks data: images
+async function sendVoucherEmail(to: string, content: EmailContent, values: VoucherValues, qrPng: Buffer | null): Promise<void> {
     const cfg = emailConfig.effective();
-    // Compile MJML template and generate HTML
-    const { html, error } = await compileVoucherEmail(vouchertmp);
-    if (error) {
-        throw new Error(error);
-    }
-    logger.debug({ html }, 'Prepared email HTML');
-    const result = await sendMail(cfg, { to: email, bcc: cfg.admin || undefined, subject: cfg.subject, html });
-    logger.info({ to: email, ...result }, 'Voucher email accepted by the SMTP server');
+    const { html, text } = await renderEmail(content, values, qrPng ? `cid:${QR_CID}` : null);
+    const result = await sendMail(cfg, {
+        to,
+        bcc: cfg.admin || undefined,
+        subject: cfg.subject,
+        html,
+        text: text || undefined,
+        inlineImages: qrPng ? [{ cid: QR_CID, filename: 'wifi-qr.png', content: qrPng }] : undefined,
+    });
+    logger.info({ to, ...result }, 'Voucher email accepted by the SMTP server');
+}
+
+const SAMPLE_VALUES = (c: EmailContent): VoucherValues => ({
+    username: 'ab12cd34',
+    password: 'Xy7kP2qR',
+    validity: '4',
+    expiryDate: formatDate(new Date(Date.now() + 4 * 3600 * 1000), c),
+    loginLink: `${CAPTIVE_PORTAL_URL.replace(/\/$/, '')}/index.html?username=ab12cd34&password=Xy7kP2qR`,
+});
+
+// Terms shown on the voucher page; the version id is recorded when accepted
+function currentTerms(c: EmailContent) {
+    const text = c.terms.trim();
+    return text ? { title: c.termsTitle, text, version: termsVersion(text) } : null;
 }
 
 logger.info(emailConfig.managedByEnv
@@ -175,7 +189,7 @@ logger.info(emailConfig.managedByEnv
 if (!secretBox.available) logger.warn('SETTINGS_ENCRYPTION_KEY not set: the SMTP password cannot be stored from Settings');
 
 app.get(`${BASEPATH}/api/config`, (_, res) => {
-    res.json({ emailEnabled: emailConfig.enabled });
+    res.json({ emailEnabled: emailConfig.enabled, terms: currentTerms(getEmailContent()) });
 });
 
 app.get(`${BASEPATH}/api/me`, (req, res) => {
@@ -207,7 +221,7 @@ app.get(`${BASEPATH}/api/history.csv`, auth.requireAdmin(), (req, res) => {
         if (/^[=+\-@]/.test(s)) s = `'${s}`;
         return /[",;\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const header = ['createdAt', 'username', 'vouchergroup', 'provider', 'validityHours', 'expiresAt', 'email', 'emailSent', 'emailError', 'operator'];
+    const header = ['createdAt', 'username', 'vouchergroup', 'provider', 'validityHours', 'expiresAt', 'email', 'emailSent', 'emailError', 'operator', 'termsAccepted', 'termsVersion'];
     const lines = [header.join(','), ...items.map((e) => header.map((h) => cell(e[h as keyof HistoryEntry])).join(','))];
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="voucher-history-${new Date().toISOString().slice(0, 10)}.csv"`);
@@ -217,6 +231,9 @@ app.get(`${BASEPATH}/api/history.csv`, auth.requireAdmin(), (req, res) => {
 const settingsView = () => ({
     syslog: getSyslogSettings(),
     email: emailConfig.view(),
+    emailContent: getEmailContent(),
+    emailTemplateManagedByEnv: !!EMAIL_TEMPLATE_PATH,
+    placeholders: PLACEHOLDERS,
     historyRetentionDays: getRetentionDays(),
     historyRetentionDaysDefault: HISTORY_RETENTION_DAYS_DEFAULT,
 });
@@ -265,6 +282,13 @@ app.put(`${BASEPATH}/api/settings`, auth.requireAdmin(), (req, res) => {
             return res.status(400).json({ error: 'Email: SETTINGS_ENCRYPTION_KEY is not set, the SMTP password cannot be stored' });
         }
     }
+    let content: EmailContent | undefined;
+    const bodyContent = (req.body ?? {}).emailContent;
+    if (bodyContent !== undefined) {
+        content = parseEmailContent(bodyContent);
+        const error = validateEmailContent(content);
+        if (error) return res.status(400).json({ error: `Email content: ${error}` });
+    }
     let days: number | undefined;
     if (body.historyRetentionDays !== undefined) {
         days = Number(body.historyRetentionDays);
@@ -273,6 +297,11 @@ app.put(`${BASEPATH}/api/settings`, auth.requireAdmin(), (req, res) => {
 
     if (syslog) store.setSetting('syslog', syslog);
     if (email) emailConfig.save(email, emailPassword);
+    if (content) {
+        store.setSetting('emailContent', content);
+        const terms = currentTerms(content);
+        if (terms) store.saveTermsVersion(terms.version, terms.text);
+    }
     if (days !== undefined) {
         store.setSetting('historyRetentionDays', days);
         purgeHistory();
@@ -323,10 +352,53 @@ app.post(`${BASEPATH}/api/settings/syslog/test`, auth.requireAdmin(), asyncHandl
     }
 }));
 
+// Renders the email content from the form with sample voucher data (QR as data: URL for the browser)
+app.post(`${BASEPATH}/api/settings/email/preview`, auth.requireAdmin(), asyncHandler(async (req, res) => {
+    const content = parseEmailContent(req.body);
+    const error = validateEmailContent(content);
+    if (error) return res.status(400).json({ error });
+    const values = SAMPLE_VALUES(content);
+    const { html, text } = await renderEmail(content, values, await QRCode.toDataURL(values.loginLink));
+    res.json({ html, text });
+}));
+
+// Sends a sample voucher email with the content from the form and the saved SMTP settings
+app.post(`${BASEPATH}/api/settings/email/sample`, auth.requireAdmin(), asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as { to?: unknown; content?: unknown };
+    const to = typeof body.to === 'string' ? body.to.trim() : '';
+    if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(to)) return res.status(400).json({ error: 'A valid recipient is required' });
+    if (!emailConfig.enabled) return res.status(400).json({ error: 'Email is not enabled: save the SMTP settings first' });
+    const content = parseEmailContent(body.content);
+    const error = validateEmailContent(content);
+    if (error) return res.status(400).json({ error });
+    const values = SAMPLE_VALUES(content);
+    try {
+        await sendVoucherEmail(to, content, values, content.showQr ? await QRCode.toBuffer(values.loginLink) : null);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(502).json({ error: (err as Error).message });
+    }
+}));
+
+// Exact text of a terms version recorded in the history
+app.get(`${BASEPATH}/api/terms/:version`, auth.requireAdmin(), (req, res) => {
+    const v = store.getTermsVersion(String(req.params.version));
+    if (!v) return res.status(404).json({ error: 'Terms version not found' });
+    res.json(v);
+});
+
 app.post(`${BASEPATH}/api/createvoucher`,
     asyncHandler(async (req, res) => {
-        const { email, validity = 14400, expirytime = Date.now() + 86400000 }
-            = (req.body ?? {}) as { email?: string; validity?: number; expirytime?: number };
+        const { email, validity = 14400, expirytime = Date.now() + 86400000, termsAccepted }
+            = (req.body ?? {}) as { email?: string; validity?: number; expirytime?: number; termsAccepted?: unknown };
+
+        // With terms and conditions configured, the operator must confirm the guest accepted them
+        const content = getEmailContent();
+        const terms = currentTerms(content);
+        if (terms && termsAccepted !== true) {
+            return res.status(400).json({ error: 'The guest must accept the terms and conditions' });
+        }
+        if (terms) store.saveTermsVersion(terms.version, terms.text);
 
 
         const vouchergroup = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
@@ -365,21 +437,21 @@ app.post(`${BASEPATH}/api/createvoucher`,
             // Generate login link and QR code
             const loginLink = `${CAPTIVE_PORTAL_URL}/index.html?username=${voucher.username}&password=${voucher.password}&redirurl=www.msftconnecttest.com/redirect`;
             let qrCodeDataUrl = '';
+            let qrPng: Buffer | null = null;
             try {
                 qrCodeDataUrl = await QRCode.toDataURL(loginLink);
+                qrPng = await QRCode.toBuffer(loginLink);
             } catch (err) {
                 logger.warn({ err }, 'Failed to generate QR code');
             }
 
-            logger.debug({ qrCodeDataUrl }, 'Generated QR code data URL');
-
-            // Prepare voucher data for email template
-            const vouchertmp = {
-                ...voucher,
-                expiryDate: new Date(Number(voucher.expirytime) * 1000).toLocaleString(),
-                validity: Number(voucher.validity) / 60 / 60,
+            const expirySecondsValue = Number(voucher.expirytime);
+            const values: VoucherValues = {
+                username: voucher.username,
+                password: voucher.password,
+                validity: String(Number(voucher.validity) / 3600),
+                expiryDate: expirySecondsValue > 0 ? formatDate(new Date(expirySecondsValue * 1000), content) : '',
                 loginLink,
-                qrCodeDataUrl
             };
 
             // The voucher already exists in OPNsense: an email failure must not hide it
@@ -387,7 +459,7 @@ app.post(`${BASEPATH}/api/createvoucher`,
             let emailError: string | undefined;
             if (emailConfig.enabled && email) {
                 try {
-                    await sendVoucherEmail(email, vouchertmp);
+                    await sendVoucherEmail(email, content, values, content.showQr ? qrPng : null);
                     emailSent = true;
                 } catch (err) {
                     emailError = (err as Error).message;
@@ -410,6 +482,8 @@ app.post(`${BASEPATH}/api/createvoucher`,
                 emailSent,
                 emailError: emailError ?? null,
                 operator: getUser(req)?.name ?? null,
+                termsAccepted: terms ? true : null,
+                termsVersion: terms?.version ?? null,
             };
             try {
                 store.addHistory(entry);

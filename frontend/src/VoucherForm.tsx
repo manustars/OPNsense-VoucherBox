@@ -18,11 +18,17 @@ export default function VoucherForm() {
   const [voucher, setVoucher] = useState<{ username: string; password: string } | null>(null);
   const [emailEnabled, setEmailEnabled] = useState(false);
   const [emailWarning, setEmailWarning] = useState<string | null>(null);
+  const [errorText, setErrorText] = useState<string | null>(null);
+  const [terms, setTerms] = useState<{ title: string; text: string; version: string } | null>(null);
+  const [termsAccepted, setTermsAccepted] = useState(false);
 
   useEffect(() => {
     fetch('api/config')
       .then(res => (res.ok ? res.json() : null))
-      .then(cfg => setEmailEnabled(Boolean(cfg?.emailEnabled)))
+      .then(cfg => {
+        setEmailEnabled(Boolean(cfg?.emailEnabled));
+        setTerms(cfg?.terms ?? null);
+      })
       .catch(() => setEmailEnabled(false));
   }, []);
 
@@ -49,6 +55,7 @@ export default function VoucherForm() {
     setQrCodeDataUrl(null);
     setVoucher(null);
     setEmailWarning(null);
+    setErrorText(null);
     const validationErrors = validate();
     setErrors(validationErrors);
     if (Object.keys(validationErrors).length > 0) return;
@@ -68,6 +75,7 @@ export default function VoucherForm() {
           email: emailEnabled && email ? email : undefined,
           validity: validitySeconds,
           expirytime: expiryTimestamp,
+          termsAccepted: terms ? termsAccepted : undefined,
         }),
       });
       if (res.ok) {
@@ -76,6 +84,7 @@ export default function VoucherForm() {
         setEmail('');
         setValidity(defaultValidity);
         setEndDate(defaultEndDate.toISOString().slice(0, 16));
+        setTermsAccepted(false);
         if (data.qrCodeDataUrl) {
           setQrCodeDataUrl(data.qrCodeDataUrl);
         }
@@ -86,6 +95,7 @@ export default function VoucherForm() {
           setEmailWarning('The voucher was created, but the email could not be sent.');
         }
       } else {
+        setErrorText((await res.json().catch(() => null))?.error ?? null);
         setFetchError(true);
       }
     } catch {
@@ -136,9 +146,21 @@ export default function VoucherForm() {
           />
           {errors.endDate && <p className="text-red-500 text-xs mt-1">{errors.endDate}</p>}
         </div>
+        {terms && (
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">{terms.title || 'Terms and conditions'}</label>
+            <div className="max-h-40 overflow-y-auto whitespace-pre-wrap text-xs text-gray-600 border border-gray-200 rounded-lg p-3 bg-gray-50">
+              {terms.text}
+            </div>
+            <label className="flex items-start gap-2 mt-2 text-sm text-gray-700">
+              <input type="checkbox" className="mt-1" checked={termsAccepted} onChange={e => setTermsAccepted(e.target.checked)} required />
+              <span>The guest has read and accepted the terms and conditions</span>
+            </label>
+          </div>
+        )}
         <button
           type="submit"
-          disabled={loading}
+          disabled={loading || (!!terms && !termsAccepted)}
           className="w-full py-2 text-lg font-semibold rounded-lg bg-blue-500 text-white hover:bg-blue-600 transition disabled:opacity-50"
         >
           {loading ? 'Creating...' : 'Create voucher'}
@@ -170,7 +192,7 @@ export default function VoucherForm() {
       )}
       {fetchError && (
         <div className="mt-6 text-red-600 font-bold text-center text-xl">
-          An error occurred
+          {errorText ?? 'An error occurred'}
         </div>
       )}
     </div>

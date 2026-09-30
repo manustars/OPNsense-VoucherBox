@@ -25,9 +25,32 @@ interface EmailSettings {
   encryptionAvailable: boolean;
 }
 
+interface EmailContent {
+  title: string;
+  intro: string;
+  instructions: string;
+  signature: string;
+  termsTitle: string;
+  terms: string;
+  labelUsername: string;
+  labelPassword: string;
+  labelValidity: string;
+  labelHours: string;
+  labelExpiry: string;
+  showQr: boolean;
+  qrCaption: string;
+  showLoginButton: boolean;
+  loginButtonText: string;
+  locale: string;
+  timeZone: string;
+}
+
 interface SettingsData {
   syslog: SyslogSettings;
   email: EmailSettings;
+  emailContent: EmailContent;
+  emailTemplateManagedByEnv: boolean;
+  placeholders: string[];
   historyRetentionDays: number;
   historyRetentionDaysDefault: number;
 }
@@ -39,6 +62,26 @@ async function readError(res: Response) {
   return (await res.json().catch(() => null))?.error ?? res.statusText;
 }
 
+const defaultContent: EmailContent = {
+  title: 'Your WiFi voucher',
+  intro: 'Hello,\nhere are your WiFi access details.',
+  instructions: '1. Connect to the WiFi network.\n2. When the login page opens, enter the username and password, or scan the QR code.',
+  signature: 'Thank you and enjoy your stay.',
+  termsTitle: 'Terms and conditions',
+  terms: '',
+  labelUsername: 'Username',
+  labelPassword: 'Password',
+  labelValidity: 'Valid for',
+  labelHours: 'hours',
+  labelExpiry: 'Expires',
+  showQr: true,
+  qrCaption: 'Scan with your phone after connecting to the WiFi.',
+  showLoginButton: false,
+  loginButtonText: 'Log in to the WiFi',
+  locale: 'en-GB',
+  timeZone: 'UTC',
+};
+
 export default function Settings() {
   const [data, setData] = useState<SettingsData | null>(null);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
@@ -47,6 +90,8 @@ export default function Settings() {
   const [smtpPassword, setSmtpPassword] = useState('');
   const [clearPassword, setClearPassword] = useState(false);
   const [testTo, setTestTo] = useState('');
+  const [preview, setPreview] = useState<string | null>(null);
+  const [sampleTo, setSampleTo] = useState('');
 
   useEffect(() => {
     fetch('api/settings')
@@ -65,6 +110,43 @@ export default function Settings() {
   const setEmail = (patch: Partial<EmailSettings>) => setData({ ...data, email: { ...m, ...patch } });
   const emailLocked = m.source === 'env';
   const passwordPayload = () => (clearPassword ? '' : smtpPassword || undefined);
+  const c = data.emailContent;
+  const setContent = (patch: Partial<EmailContent>) => setData({ ...data, emailContent: { ...c, ...patch } });
+
+  const runPreview = async () => {
+    setMessage(null);
+    const res = await fetch('api/settings/email/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) });
+    if (!res.ok) return setMessage({ ok: false, text: `Preview failed: ${await readError(res)}` });
+    setPreview((await res.json()).html);
+  };
+
+  const sendSample = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const res = await fetch('api/settings/email/sample', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: sampleTo, content: c }) });
+      if (!res.ok) throw new Error(await readError(res));
+      setMessage({ ok: true, text: `Sample voucher email sent to ${sampleTo}` });
+    } catch (e) {
+      setMessage({ ok: false, text: `Sample email failed: ${(e as Error).message}` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const area = (key: keyof EmailContent, labelText: string, rows = 3, hint?: string) => (
+    <div>
+      <label className={label}>{labelText}</label>
+      <textarea className={input} rows={rows} value={c[key] as string} onChange={(e) => setContent({ [key]: e.target.value } as Partial<EmailContent>)} />
+      {hint && <p className="text-xs text-gray-500 mt-1">{hint}</p>}
+    </div>
+  );
+  const line = (key: keyof EmailContent, labelText: string) => (
+    <div>
+      <label className={label}>{labelText}</label>
+      <input className={input} value={c[key] as string} onChange={(e) => setContent({ [key]: e.target.value } as Partial<EmailContent>)} />
+    </div>
+  );
 
   const save = async () => {
     setBusy(true);
@@ -76,6 +158,7 @@ export default function Settings() {
         body: JSON.stringify({
           syslog: s,
           ...(emailLocked ? {} : { email: { ...m, password: passwordPayload() } }),
+          emailContent: c,
           historyRetentionDays: data.historyRetentionDays,
         }),
       });
@@ -206,6 +289,71 @@ export default function Settings() {
             Send test email
           </button>
         </div>
+      </section>
+
+      <section className="space-y-4">
+        <h2 className="text-2xl font-bold text-gray-800">Voucher email &amp; terms</h2>
+        {data.emailTemplateManagedByEnv && (
+          <p className="text-sm text-amber-700 bg-amber-50 p-3 rounded-lg">
+            The email layout comes from a custom template file (EMAIL_TEMPLATE_PATH): the texts below are not used in the email. Terms and conditions still apply to the voucher page.
+          </p>
+        )}
+        <p className="text-sm text-gray-500">
+          Plain text, one paragraph per line. Placeholders: {data.placeholders.map((p) => `{{${p}}}`).join(' ')}
+        </p>
+        {line('title', 'Title')}
+        {area('intro', 'Introduction')}
+        {area('instructions', 'Instructions')}
+        {area('signature', 'Signature', 2)}
+        <div className="grid grid-cols-2 gap-4">
+          {line('labelUsername', 'Label: username')}
+          {line('labelPassword', 'Label: password')}
+          {line('labelValidity', 'Label: validity')}
+          {line('labelHours', 'Label: hours')}
+          {line('labelExpiry', 'Label: expiry')}
+          <div className="grid grid-cols-2 gap-2">
+            {line('locale', 'Date locale')}
+            {line('timeZone', 'Time zone')}
+          </div>
+        </div>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={c.showQr} onChange={(e) => setContent({ showQr: e.target.checked })} />
+          <span className="text-gray-700">Show QR code</span>
+        </label>
+        {c.showQr && line('qrCaption', 'QR code caption')}
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={c.showLoginButton} onChange={(e) => setContent({ showLoginButton: e.target.checked })} />
+          <span className="text-gray-700">Show login button</span>
+        </label>
+        {c.showLoginButton && (
+          <>
+            {line('loginButtonText', 'Login button text')}
+            <p className="text-xs text-amber-700">The button links to the captive portal with the password in the URL: spam filters often flag it.</p>
+          </>
+        )}
+        {line('termsTitle', 'Terms title')}
+        {area('terms', 'Terms and conditions', 6, 'Shown at the bottom of the email and on the voucher page, where the operator must confirm the guest accepted them (recorded in the history). Empty = no terms.')}
+        <div className="flex flex-wrap gap-2">
+          <button onClick={runPreview} className="px-4 py-2 rounded-lg border border-gray-300 hover:bg-gray-100">Preview</button>
+          <button onClick={() => setData({ ...data, emailContent: { ...defaultContent } })} className="px-4 py-2 rounded-lg border border-gray-300 hover:bg-gray-100">
+            Reset to default
+          </button>
+        </div>
+        <div className="flex gap-2">
+          <input className={input} value={sampleTo} placeholder="send a sample voucher email to…" onChange={(e) => setSampleTo(e.target.value)} />
+          <button disabled={busy || !sampleTo || !data.email.enabled} onClick={sendSample} className="px-4 py-2 rounded-lg border border-gray-300 hover:bg-gray-100 disabled:opacity-50 whitespace-nowrap">
+            Send sample
+          </button>
+        </div>
+        {preview !== null && (
+          <div className="border border-gray-200 rounded-lg overflow-hidden">
+            <div className="flex justify-between items-center px-3 py-1 bg-gray-50 text-xs text-gray-500">
+              <span>Preview with sample data</span>
+              <button onClick={() => setPreview(null)}>close</button>
+            </div>
+            <iframe title="Email preview" sandbox="" srcDoc={preview} className="w-full" style={{ height: 640 }} />
+          </div>
+        )}
       </section>
 
       <section className="space-y-4">
