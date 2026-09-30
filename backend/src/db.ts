@@ -68,6 +68,17 @@ function toEntry(r: HistoryRow): HistoryEntry {
 
 export type UserRole = 'user' | 'admin';
 
+export interface SessionRow {
+    id_hash: string;
+    user_json: string;
+    local_id: number | null;
+    created_at: string;
+    last_seen_at: string;
+    expires_at: string;
+    ip: string | null;
+    user_agent: string | null;
+}
+
 export interface LocalUser {
     id: number;
     username: string;
@@ -146,6 +157,18 @@ export class Store {
             );
         `);
         this.db.exec(`
+            CREATE TABLE IF NOT EXISTS sessions (
+                -- SHA-256 of the session id: the id itself lives only in the cookie
+                id_hash      TEXT PRIMARY KEY,
+                user_json    TEXT NOT NULL,
+                local_id     INTEGER,
+                created_at   TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at   TEXT NOT NULL,
+                ip           TEXT,
+                user_agent   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_local ON sessions (local_id);
             CREATE TABLE IF NOT EXISTS terms_versions (
                 version    TEXT PRIMARY KEY,
                 text       TEXT NOT NULL,
@@ -204,7 +227,60 @@ export class Store {
         return Number(res.changes);
     }
 
-    // --- terms and conditions versions (the exact text accepted by a guest stays available) ---
+    // --- server-side sessions ---
+
+    createSession(idHash: string, userJson: string, localId: number | null, expiresAt: string, ip: string | null, userAgent: string | null): void {
+        const now = new Date().toISOString();
+        this.db.prepare('INSERT INTO sessions (id_hash, user_json, local_id, created_at, last_seen_at, expires_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            .run(idHash, userJson, localId, now, now, expiresAt, ip, userAgent);
+    }
+
+    getSession(idHash: string): SessionRow | undefined {
+        return this.db.prepare('SELECT * FROM sessions WHERE id_hash = ?').get(idHash) as SessionRow | undefined;
+    }
+
+    touchSession(idHash: string): void {
+        this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id_hash = ?').run(new Date().toISOString(), idHash);
+    }
+
+    deleteSession(idHash: string): void {
+        this.db.prepare('DELETE FROM sessions WHERE id_hash = ?').run(idHash);
+    }
+
+    // Revokes every session of a local user, optionally keeping one (the caller's). Returns the number revoked.
+    deleteUserSessions(localId: number, exceptIdHash?: string): number {
+        const res = exceptIdHash
+            ? this.db.prepare('DELETE FROM sessions WHERE local_id = ? AND id_hash <> ?').run(localId, exceptIdHash)
+            : this.db.prepare('DELETE FROM sessions WHERE local_id = ?').run(localId);
+        return Number(res.changes);
+    }
+
+    countUserSessions(localId: number): number {
+        return (this.db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE local_id = ?').get(localId) as { c: number }).c;
+    }
+
+    purgeSessions(idleCutoff: string): number {
+        const res = this.db.prepare('DELETE FROM sessions WHERE expires_at < ? OR last_seen_at < ?').run(new Date().toISOString(), idleCutoff);
+        return Number(res.changes);
+    }
+
+    // --- counters for rate limits (from the history, so they survive restarts) ---
+
+    countVouchers(sinceIso: string, operator?: string | null): number {
+        if (operator === undefined) {
+            return (this.db.prepare('SELECT COUNT(*) AS c FROM voucher_history WHERE created_at >= ?').get(sinceIso) as { c: number }).c;
+        }
+        return (this.db.prepare('SELECT COUNT(*) AS c FROM voucher_history WHERE created_at >= ? AND operator IS ?').get(sinceIso, operator) as { c: number }).c;
+    }
+
+    countEmails(sinceIso: string, filter: { operator?: string | null; recipient?: string }): number {
+        if (filter.recipient !== undefined) {
+            return (this.db.prepare('SELECT COUNT(*) AS c FROM voucher_history WHERE created_at >= ? AND email = ? COLLATE NOCASE').get(sinceIso, filter.recipient) as { c: number }).c;
+        }
+        return (this.db.prepare('SELECT COUNT(*) AS c FROM voucher_history WHERE created_at >= ? AND email IS NOT NULL AND operator IS ?').get(sinceIso, filter.operator ?? null) as { c: number }).c;
+    }
+
+    // --- terms and conditions versions (the exact text shown/sent stays available) ---
 
     saveTermsVersion(version: string, text: string): void {
         this.db.prepare('INSERT OR IGNORE INTO terms_versions (version, text, created_at) VALUES (?, ?, ?)')

@@ -32,6 +32,8 @@ interface EmailContent {
   signature: string;
   termsTitle: string;
   terms: string;
+  termsConfirmation: boolean;
+  termsConfirmText: string;
   labelUsername: string;
   labelPassword: string;
   labelValidity: string;
@@ -45,7 +47,17 @@ interface EmailContent {
   timeZone: string;
 }
 
+interface Limits {
+  vouchersPerUserHour: number;
+  vouchersPerUserDay: number;
+  emailsPerUserHour: number;
+  emailsPerRecipientDay: number;
+  vouchersPerInstanceDay: number;
+  maxValidityDays: number;
+}
+
 interface SettingsData {
+  limits: Limits;
   syslog: SyslogSettings;
   email: EmailSettings;
   emailContent: EmailContent;
@@ -69,6 +81,8 @@ const defaultContent: EmailContent = {
   signature: 'Thank you and enjoy your stay.',
   termsTitle: 'Terms and conditions',
   terms: '',
+  termsConfirmation: false,
+  termsConfirmText: 'I have informed the guest of the terms and conditions',
   labelUsername: 'Username',
   labelPassword: 'Password',
   labelValidity: 'Valid for',
@@ -159,6 +173,7 @@ export default function Settings() {
           syslog: s,
           ...(emailLocked ? {} : { email: { ...m, password: passwordPayload() } }),
           emailContent: c,
+          limits: data.limits,
           historyRetentionDays: data.historyRetentionDays,
         }),
       });
@@ -332,7 +347,12 @@ export default function Settings() {
           </>
         )}
         {line('termsTitle', 'Terms title')}
-        {area('terms', 'Terms and conditions', 6, 'Shown at the bottom of the email and on the voucher page, where the operator must confirm the guest accepted them (recorded in the history). Empty = no terms.')}
+        {area('terms', 'Terms and conditions', 6, 'Shown at the bottom of the email and on the voucher page; the version shown/sent is recorded in the history. Empty = no terms.')}
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={c.termsConfirmation} onChange={(e) => setContent({ termsConfirmation: e.target.checked })} />
+          <span className="text-gray-700">Require the operator to confirm before creating a voucher</span>
+        </label>
+        {c.termsConfirmation && line('termsConfirmText', 'Confirmation text (what the operator confirms)')}
         <div className="flex flex-wrap gap-2">
           <button onClick={runPreview} className="px-4 py-2 rounded-lg border border-gray-300 hover:bg-gray-100">Preview</button>
           <button onClick={() => setData({ ...data, emailContent: { ...defaultContent } })} className="px-4 py-2 rounded-lg border border-gray-300 hover:bg-gray-100">
@@ -402,6 +422,26 @@ export default function Settings() {
         <button disabled={busy || !s.host} onClick={test} className="px-4 py-2 rounded-lg border border-gray-300 hover:bg-gray-100 disabled:opacity-50">
           Send test message
         </button>
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-2xl font-bold text-gray-800">Limits</h2>
+        <p className="text-sm text-gray-500">Protection against abuse (e.g. a stolen account or spam through the voucher emails). 0 = no limit.</p>
+        <div className="grid grid-cols-2 gap-4">
+          {([
+            ['vouchersPerUserHour', 'Vouchers per user per hour'],
+            ['vouchersPerUserDay', 'Vouchers per user per day'],
+            ['emailsPerUserHour', 'Emails per user per hour'],
+            ['emailsPerRecipientDay', 'Emails to the same address per day'],
+            ['vouchersPerInstanceDay', 'Vouchers per day (whole instance)'],
+            ['maxValidityDays', 'Maximum voucher validity (days)'],
+          ] as [keyof Limits, string][]).map(([k, text]) => (
+            <div key={k}>
+              <label className={label}>{text}</label>
+              <input type="number" min={0} className={input} value={data.limits[k]} onChange={(e) => setData({ ...data, limits: { ...data.limits, [k]: Number(e.target.value) } })} />
+            </div>
+          ))}
+        </div>
       </section>
 
       <section className="space-y-2">

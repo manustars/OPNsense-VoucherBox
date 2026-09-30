@@ -12,6 +12,8 @@ import { SyslogSettings, defaultSyslogSettings, sendSyslog, validateSyslogSettin
 import { Auth, getUser, loadAuthConfig } from './auth';
 import { EmailConfig, EmailSettings, parseEmailSettings, sendMail, validateEmailSettings } from './email';
 import { SecretBox } from './secrets';
+import helmet from 'helmet';
+import { Limits, checkLimits, defaultLimits, parseLimits, validateLimits } from './limits';
 import { EmailContent, PLACEHOLDERS, RenderedEmail, VoucherValues, defaultEmailContent, formatDate, parseEmailContent, renderVoucherEmail, termsVersion, validateEmailContent } from './emailContent';
 import path from 'path';
 import QRCode from 'qrcode';
@@ -45,7 +47,57 @@ export const logger = pino({
 
 
 const app = express();
-app.use(express.json());
+app.disable('x-powered-by');
+
+// Reverse proxies in front of the app (ingress): req.ip is taken from X-Forwarded-For only for these hops
+const TRUST_PROXY = process.env.TRUST_PROXY ?? '1';
+app.set('trust proxy', /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY === 'true' ? true : TRUST_PROXY === 'false' ? false : TRUST_PROXY);
+
+const HTTPS_PUBLIC = (process.env.PUBLIC_URL || '').startsWith('https://');
+app.use(helmet({
+    contentSecurityPolicy: {
+        useDefaults: false,
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            // inline styles: index.html body style and the email preview (srcdoc iframe inherits this policy)
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", 'data:'],
+            fontSrc: ["'self'", 'data:'],
+            connectSrc: ["'self'"],
+            frameSrc: ["'self'"],
+            frameAncestors: ["'none'"],
+            formAction: ["'self'"],
+            baseUri: ["'self'"],
+            objectSrc: ["'none'"],
+            ...(HTTPS_PUBLIC ? { upgradeInsecureRequests: [] } : {}),
+        },
+    },
+    // HSTS only makes sense when the app is served over HTTPS
+    strictTransportSecurity: HTTPS_PUBLIC ? { maxAge: 15552000 } : false,
+    referrerPolicy: { policy: 'no-referrer' },
+    crossOriginEmbedderPolicy: false,
+}));
+
+app.use(express.json({ limit: '100kb' }));
+
+// CSRF defence in depth (besides SameSite cookies): state-changing requests must come from this origin
+app.use((req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    const origin = req.headers.origin;
+    if (origin) {
+        let host = '';
+        try {
+            host = new URL(origin).host;
+        } catch {
+            // invalid Origin header
+        }
+        if (host !== req.headers.host) return res.status(403).json({ error: 'Cross-origin request blocked' });
+    } else if (req.headers['sec-fetch-site'] === 'cross-site') {
+        return res.status(403).json({ error: 'Cross-origin request blocked' });
+    }
+    next();
+});
 
 // Advanced: a custom MJML/Handlebars file replaces the email content edited in Settings
 const EMAIL_TEMPLATE_PATH = process.env.EMAIL_TEMPLATE_PATH || '';
@@ -107,7 +159,11 @@ app.get(`${BASEPATH}/healthz`, (_, res) => {
 });
 
 // Login (AUTH_MODE: none | local | oidc | local+oidc): when enabled, the API below requires a session
-const auth = new Auth(loadAuthConfig(process.env), BASEPATH, store);
+const auth = new Auth(loadAuthConfig(process.env), BASEPATH, store, (event, data) => {
+    logger.info({ event, ...data }, 'Audit');
+    emitSyslog(event, { event, ...data });
+});
+setInterval(() => auth.purgeSessions(), 10 * 60000).unref();
 auth.install(app);
 auth.bootstrap().catch((err) => {
     logger.fatal({ err }, 'Failed to create the local admin user');
@@ -177,11 +233,17 @@ const SAMPLE_VALUES = (c: EmailContent): VoucherValues => ({
     loginLink: `${CAPTIVE_PORTAL_URL.replace(/\/$/, '')}/index.html?username=ab12cd34&password=Xy7kP2qR`,
 });
 
-// Terms shown on the voucher page; the version id is recorded when accepted
+const getLimits = (): Limits => ({ ...defaultLimits, ...store.getSetting<Partial<Limits>>('limits', {}) });
+
+// Terms shown on the voucher page; the version shown/sent is recorded in the history
 function currentTerms(c: EmailContent) {
     const text = c.terms.trim();
-    return text ? { title: c.termsTitle, text, version: termsVersion(text) } : null;
+    return text
+        ? { title: c.termsTitle, text, version: termsVersion(text), confirmation: c.termsConfirmation, confirmText: c.termsConfirmText }
+        : null;
 }
+
+const EMAIL_ADDRESS_RE = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/;
 
 logger.info(emailConfig.managedByEnv
     ? 'Email delivery configured by environment (SMTP_HOST)'
@@ -189,7 +251,7 @@ logger.info(emailConfig.managedByEnv
 if (!secretBox.available) logger.warn('SETTINGS_ENCRYPTION_KEY not set: the SMTP password cannot be stored from Settings');
 
 app.get(`${BASEPATH}/api/config`, (_, res) => {
-    res.json({ emailEnabled: emailConfig.enabled, terms: currentTerms(getEmailContent()) });
+    res.json({ emailEnabled: emailConfig.enabled, terms: currentTerms(getEmailContent()), maxValidityDays: getLimits().maxValidityDays });
 });
 
 app.get(`${BASEPATH}/api/me`, (req, res) => {
@@ -200,6 +262,7 @@ app.get(`${BASEPATH}/api/me`, (req, res) => {
         authenticated: !auth.enabled || !!user,
         user: user ? { name: user.name, email: user.email, source: user.source } : null,
         isAdmin: auth.isAdmin(user),
+        session: auth.enabled ? auth.sessionPolicy : null,
     });
 });
 
@@ -236,6 +299,7 @@ const settingsView = () => ({
     placeholders: PLACEHOLDERS,
     historyRetentionDays: getRetentionDays(),
     historyRetentionDaysDefault: HISTORY_RETENTION_DAYS_DEFAULT,
+    limits: getLimits(),
 });
 
 app.get(`${BASEPATH}/api/settings`, auth.requireAdmin(), (_, res) => {
@@ -289,6 +353,13 @@ app.put(`${BASEPATH}/api/settings`, auth.requireAdmin(), (req, res) => {
         const error = validateEmailContent(content);
         if (error) return res.status(400).json({ error: `Email content: ${error}` });
     }
+    let limits: Limits | undefined;
+    const bodyLimits = (req.body ?? {}).limits;
+    if (bodyLimits !== undefined) {
+        limits = parseLimits(bodyLimits);
+        const error = validateLimits(limits);
+        if (error) return res.status(400).json({ error: `Limits: ${error}` });
+    }
     let days: number | undefined;
     if (body.historyRetentionDays !== undefined) {
         days = Number(body.historyRetentionDays);
@@ -302,6 +373,7 @@ app.put(`${BASEPATH}/api/settings`, auth.requireAdmin(), (req, res) => {
         const terms = currentTerms(content);
         if (terms) store.saveTermsVersion(terms.version, terms.text);
     }
+    if (limits) store.setSetting('limits', limits);
     if (days !== undefined) {
         store.setSetting('historyRetentionDays', days);
         purgeHistory();
@@ -389,14 +461,42 @@ app.get(`${BASEPATH}/api/terms/:version`, auth.requireAdmin(), (req, res) => {
 
 app.post(`${BASEPATH}/api/createvoucher`,
     asyncHandler(async (req, res) => {
-        const { email, validity = 14400, expirytime = Date.now() + 86400000, termsAccepted }
-            = (req.body ?? {}) as { email?: string; validity?: number; expirytime?: number; termsAccepted?: unknown };
+        const body = (req.body ?? {}) as { email?: unknown; validity?: unknown; expirytime?: unknown; termsAccepted?: unknown };
+        const limits = getLimits();
+        const maxSeconds = limits.maxValidityDays * 86400;
 
-        // With terms and conditions configured, the operator must confirm the guest accepted them
+        // Server-side validation: never trust the browser
+        const validity = body.validity === undefined ? 14400 : Number(body.validity);
+        if (!Number.isInteger(validity) || validity < 3600 || validity > maxSeconds) {
+            return res.status(400).json({ error: `Validity must be between 1 hour and ${limits.maxValidityDays} days` });
+        }
+        // expirytime: seconds after which the voucher expires even if unused (0 = none)
+        const expirytime = body.expirytime === undefined ? Math.min(86400, maxSeconds) : Number(body.expirytime);
+        if (!Number.isInteger(expirytime) || expirytime < 0 || expirytime > maxSeconds) {
+            return res.status(400).json({ error: `The end date must be within ${limits.maxValidityDays} days` });
+        }
+        let email: string | undefined;
+        if (body.email !== undefined && body.email !== null && body.email !== '') {
+            if (typeof body.email !== 'string' || body.email.length > 254 || !EMAIL_ADDRESS_RE.test(body.email.trim())) {
+                return res.status(400).json({ error: 'Invalid email address' });
+            }
+            email = body.email.trim();
+        }
+
+        // Terms: always recorded when configured; the operator confirmation is optional (Settings)
         const content = getEmailContent();
         const terms = currentTerms(content);
-        if (terms && termsAccepted !== true) {
-            return res.status(400).json({ error: 'The guest must accept the terms and conditions' });
+        if (terms?.confirmation && body.termsAccepted !== true) {
+            return res.status(400).json({ error: `Please confirm: "${terms.confirmText}"` });
+        }
+
+        // Abuse limits, checked before calling OPNsense
+        const operatorName = getUser(req)?.name ?? null;
+        const limitError = checkLimits(store, limits, operatorName, emailConfig.enabled ? email ?? null : null);
+        if (limitError) {
+            logger.warn({ operator: operatorName, reason: limitError }, 'Voucher creation rate limited');
+            emitSyslog('voucher.rate_limited', { event: 'voucher.rate_limited', operator: operatorName, reason: limitError, ip: req.ip });
+            return res.status(429).json({ error: limitError });
         }
         if (terms) store.saveTermsVersion(terms.version, terms.text);
 
@@ -482,7 +582,7 @@ app.post(`${BASEPATH}/api/createvoucher`,
                 emailSent,
                 emailError: emailError ?? null,
                 operator: getUser(req)?.name ?? null,
-                termsAccepted: terms ? true : null,
+                termsAccepted: terms?.confirmation ? true : null,
                 termsVersion: terms?.version ?? null,
             };
             try {

@@ -23,6 +23,12 @@ export default function Account({ name }: { name: string }) {
     }
   };
 
+  const logoutOthers = async () => {
+    const res = await fetch('api/account/logout-others', { method: 'POST' });
+    const data = await res.json().catch(() => null);
+    setMessage(res.ok ? { ok: true, text: `${data.revoked} other session(s) signed out` } : { ok: false, text: data?.error ?? res.statusText });
+  };
+
   const input = 'w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400';
   return (
     <form onSubmit={submit} className="max-w-md mx-auto mt-8 p-8 rounded-xl shadow-lg bg-white space-y-4">
@@ -40,6 +46,8 @@ export default function Account({ name }: { name: string }) {
         <input type="password" autoComplete="new-password" className={input} value={confirm} onChange={(e) => setConfirm(e.target.value)} required />
       </div>
       <button type="submit" className="w-full py-2 font-semibold rounded-lg bg-blue-500 text-white hover:bg-blue-600">Change password</button>
+      <p className="text-xs text-gray-500">Changing the password signs out your other sessions.</p>
+      <button type="button" onClick={logoutOthers} className="w-full py-2 rounded-lg border border-gray-300 hover:bg-gray-100">Sign out my other sessions</button>
       {message && <p className={message.ok ? 'text-green-600' : 'text-red-600'}>{message.text}</p>}
     </form>
   );

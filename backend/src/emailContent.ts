@@ -10,8 +10,11 @@ export interface EmailContent {
     instructions: string;
     signature: string;
     termsTitle: string;
-    // Terms and conditions: shown in the email and on the voucher page (acceptance is recorded)
+    // Terms and conditions: shown in the email and on the voucher page; the version shown/sent is recorded
     terms: string;
+    // Optional checkbox the operator must tick on the voucher page (recorded in the history)
+    termsConfirmation: boolean;
+    termsConfirmText: string;
     labelUsername: string;
     labelPassword: string;
     labelValidity: string;
@@ -34,6 +37,8 @@ export const defaultEmailContent: EmailContent = {
     signature: 'Thank you and enjoy your stay.',
     termsTitle: 'Terms and conditions',
     terms: '',
+    termsConfirmation: false,
+    termsConfirmText: 'I have informed the guest of the terms and conditions',
     labelUsername: 'Username',
     labelPassword: 'Password',
     labelValidity: 'Valid for',
@@ -51,7 +56,7 @@ export const PLACEHOLDERS = ['username', 'password', 'validity', 'expiryDate', '
 export type VoucherValues = Record<(typeof PLACEHOLDERS)[number], string>;
 
 const TEXT_FIELDS: (keyof EmailContent)[] = [
-    'title', 'intro', 'instructions', 'signature', 'termsTitle', 'terms',
+    'title', 'intro', 'instructions', 'signature', 'termsTitle', 'terms', 'termsConfirmText',
     'labelUsername', 'labelPassword', 'labelValidity', 'labelHours', 'labelExpiry', 'qrCaption', 'loginButtonText',
 ];
 
@@ -64,6 +69,7 @@ export function parseEmailContent(body: unknown): EmailContent {
     }
     out.showQr = b.showQr === undefined ? defaultEmailContent.showQr : b.showQr === true;
     out.showLoginButton = b.showLoginButton === true;
+    out.termsConfirmation = b.termsConfirmation === true;
     if (typeof b.locale === 'string') out.locale = b.locale.trim();
     if (typeof b.timeZone === 'string') out.timeZone = b.timeZone.trim();
     return out;

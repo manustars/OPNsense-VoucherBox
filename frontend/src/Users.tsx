@@ -8,6 +8,7 @@ interface LocalUser {
   lockedUntil: string | null;
   lastLoginAt: string | null;
   createdAt: string;
+  activeSessions: number;
 }
 
 const input = 'px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400';
@@ -71,6 +72,7 @@ export default function Users() {
               <th className="py-2 pr-3">Role</th>
               <th className="py-2 pr-3">Status</th>
               <th className="py-2 pr-3">Last login</th>
+              <th className="py-2 pr-3">Sessions</th>
               <th className="py-2 pr-3"></th>
             </tr>
           </thead>
@@ -92,6 +94,14 @@ export default function Users() {
                   {u.disabled ? <span className="text-gray-400">disabled</span> : locked(u) ? <span className="text-amber-600">locked</span> : 'active'}
                 </td>
                 <td className="py-2 pr-3 whitespace-nowrap">{u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : '—'}</td>
+                <td className="py-2 pr-3">
+                  {u.activeSessions}
+                  {u.activeSessions > 0 && (
+                    <button className="ml-2 text-blue-600 hover:underline" onClick={() => run(() => api(`api/users/${u.id}/sessions`, 'DELETE'), `Sessions of ${u.username} signed out`)}>
+                      sign out
+                    </button>
+                  )}
+                </td>
                 <td className="py-2 pr-3 whitespace-nowrap text-right space-x-2">
                   <button className="px-2 py-1 rounded border hover:bg-gray-100" onClick={() => resetPassword(u)}>Set password</button>
                   <button
